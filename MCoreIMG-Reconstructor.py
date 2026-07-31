@@ -39,7 +39,6 @@ import json
 import math
 import os
 import sys
-import subprocess
 import tkinter as tk
 import zlib
 from dataclasses import dataclass, field
@@ -49,7 +48,7 @@ from tkinter import filedialog
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 except ImportError as exc:  # pragma: no cover - environment dependent
     raise SystemExit(
         "Pillow is required. Install it with: sudo pacman -S python-pillow"
@@ -91,8 +90,6 @@ TEXT_ALPHABET = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-+./?:,()[]#_=@"
 assert len(TEXT_ALPHABET) <= 64
 MAX_TEXT_LEN = 31
 MAX_EDITOR_COMMANDS = 512
-DEFAULT_TEXT_FONT_SIZE = 20
-RECONSTRUCTOR_BUILD = "2026.07.31-fontfix3-hardcoded"
 
 COLOR_TABLE: List[Tuple[str, str, str]] = [
     ("0", "Black", "#000000"),
@@ -209,53 +206,6 @@ class StreamState:
 # ---------------------------------------------------------------------------
 # General helpers
 # ---------------------------------------------------------------------------
-
-
-def load_text_font(font_size: int) -> Tuple[ImageFont.ImageFont, str]:
-    """Load a real scalable font; never silently fall back to the tiny bitmap font."""
-    font_size = max(1, int(font_size))
-
-    candidates = [
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",              # Arch Linux
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-        "DejaVuSans-Bold.ttf",
-        "DejaVuSans.ttf",
-    ]
-
-    # Ask fontconfig as a final system-font lookup before using Pillow's default.
-    try:
-        matched = subprocess.run(
-            ["fc-match", "-f", "%{file}", "DejaVu Sans:style=Bold"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        ).stdout.strip()
-        if matched:
-            candidates.append(matched)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    tried = set()
-    for candidate in candidates:
-        if not candidate or candidate in tried:
-            continue
-        tried.add(candidate)
-        try:
-            return ImageFont.truetype(candidate, font_size), candidate
-        except OSError:
-            continue
-
-    # Newer Pillow versions can scale the bundled default font. This remains
-    # visibly larger than the historic unscaled 8-pixel fallback.
-    try:
-        return ImageFont.load_default(size=font_size), f"Pillow default at {font_size}px"
-    except TypeError as exc:
-        raise CodecError(
-            "No scalable font was found. Install one with: sudo pacman -S ttf-dejavu"
-        ) from exc
 
 
 def clamp(value: int, lo: int, hi: int) -> int:
@@ -1129,24 +1079,14 @@ def draw_double_box(
     draw.line([(left, divider_y), (right, divider_y)], fill=color, width=2)
 
 
-def render_command(
-    command: DrawCommand,
-    target: ImageDraw.ImageDraw,
-    text_font: ImageFont.ImageFont,
-) -> None:
+def render_command(command: DrawCommand, target: ImageDraw.ImageDraw) -> None:
     validate_command(command)
     fields = command.fields
     opcode = command.opcode
     color = COLOR_HEX[command.color]
 
     if opcode == 0x0:
-        target.text(
-            (fields["x"], fields["y"]),
-            fields["text"],
-            fill=color,
-            font=text_font,
-            anchor="lt",
-        )
+        target.text((fields["x"], fields["y"]), fields["text"], fill=color)
     elif opcode == 0x1:
         draw_line(
             target,
@@ -1280,23 +1220,17 @@ def render_command(
         raise CodecError(f"Unsupported opcode {opcode}.")
 
 
-def render_image(
-    commands: Sequence[DrawCommand],
-    output_path: Path,
-    text_font_size: int = DEFAULT_TEXT_FONT_SIZE,
-) -> str:
+def render_image(commands: Sequence[DrawCommand], output_path: Path) -> None:
     image = Image.new("RGB", (CANVAS_W, CANVAS_H), BACKGROUND)
     draw = ImageDraw.Draw(image)
-    text_font, font_source = load_text_font(text_font_size)
     for index, command in enumerate(commands):
         try:
-            render_command(command, draw, text_font)
+            render_command(command, draw)
         except Exception as exc:
             image.close()
             raise CodecError(f"Render failed on command {index}: {exc}") from exc
     image.save(output_path)
     image.close()
-    return font_source
 
 
 # ---------------------------------------------------------------------------
@@ -1485,16 +1419,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        font_source = render_image(
-            commands,
-            output_path,
-            text_font_size=DEFAULT_TEXT_FONT_SIZE,
-        )
+        render_image(commands, output_path)
     except (CodecError, OSError) as exc:
         print(f"Could not render PNG: {exc}", file=sys.stderr)
         return 5
 
-    print(f"MCoreIMG Reconstructor build: {RECONSTRUCTOR_BUILD}")
     print(f"MCoreIMG image ID: {image_id}")
     print(f"Validated frames: {len(frames) - duplicate_count}")
     if duplicate_count:
@@ -1502,8 +1431,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if ignored_lines:
         print(f"Non-MCoreIMG lines ignored: {ignored_lines}")
     print(f"Decoded commands: {len(commands)}")
-    print(f"Rendered text font size: {DEFAULT_TEXT_FONT_SIZE} px (hard-coded)")
-    print(f"Rendered text font: {font_source}")
     print(f"Image reconstruction complete: {output_path}")
 
     if args.list_commands:

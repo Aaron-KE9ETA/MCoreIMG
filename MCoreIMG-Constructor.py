@@ -82,6 +82,7 @@ CANVAS_W = 720
 CANVAS_H = 480
 PROTOCOL_NAME = "MCoreIMG"
 PROTOCOL_VERSION = 1
+BITSTREAM_VERSION = 2
 SOURCE_FORMAT = "MCoreIMG-source"
 SOURCE_VERSION = 1
 DEFAULT_GRID = "EN60"  # source metadata only; not transmitted
@@ -89,7 +90,7 @@ DEFAULT_GRID = "EN60"  # source metadata only; not transmitted
 # Shared text size for both the Tk preview and PNG export.
 DEFAULT_TEXT_FONT_SIZE = 20
 TEXT_FONT_WEIGHT = "bold"
-CONSTRUCTOR_BUILD = "2026.07.31-fontfix3"
+CONSTRUCTOR_BUILD = "2026.07.31-oplocal-v2"
 
 
 def load_text_font(font_size: int = DEFAULT_TEXT_FONT_SIZE):
@@ -550,7 +551,26 @@ class BitReader:
 
 
 @dataclass
+class OpcodeState:
+    has_point: bool = False
+    x: int = 0
+    y: int = 0
+    has_color: bool = False
+    color: int = 0
+    params: Dict[str, int] = field(default_factory=dict)
+    previous_command: Optional[DrawCommand] = None
+
+
+@dataclass
 class StreamState:
+    has_opcode: bool = False
+    opcode: int = 0
+    opcode_states: Dict[int, OpcodeState] = field(default_factory=dict)
+    previous_command: Optional[DrawCommand] = None
+
+
+@dataclass
+class LegacyStreamState:
     has_point: bool = False
     x: int = 0
     y: int = 0
@@ -562,6 +582,12 @@ class StreamState:
     previous_command: Optional[DrawCommand] = None
 
 
+def get_opcode_state(state: StreamState, opcode: int) -> OpcodeState:
+    if opcode not in SHAPE_BY_OPCODE:
+        raise CodecError(f"Unknown opcode {opcode}.")
+    return state.opcode_states.setdefault(opcode, OpcodeState())
+
+
 def rice_unsigned_bit_length(value: int, k: int) -> int:
     return (value >> k) + 1 + k
 
@@ -571,7 +597,7 @@ def rice_signed_bit_length(value: int, k: int) -> int:
     return rice_unsigned_bit_length(zigzag, k)
 
 
-def write_stateful_fixed(writer: BitWriter, state: StreamState, key: str, value: int, width: int) -> None:
+def write_stateful_fixed(writer: BitWriter, state: OpcodeState, key: str, value: int, width: int) -> None:
     same = state.params.get(key) == value
     writer.write_bit(same)
     if not same:
@@ -579,7 +605,7 @@ def write_stateful_fixed(writer: BitWriter, state: StreamState, key: str, value:
         state.params[key] = value
 
 
-def read_stateful_fixed(reader: BitReader, state: StreamState, key: str, width: int) -> int:
+def read_stateful_fixed(reader: BitReader, state: OpcodeState, key: str, width: int) -> int:
     same = bool(reader.read_bit())
     if same:
         if key not in state.params:
@@ -590,7 +616,7 @@ def read_stateful_fixed(reader: BitReader, state: StreamState, key: str, width: 
     return value
 
 
-def write_stateful_ue(writer: BitWriter, state: StreamState, key: str, value: int) -> None:
+def write_stateful_ue(writer: BitWriter, state: OpcodeState, key: str, value: int) -> None:
     same = state.params.get(key) == value
     writer.write_bit(same)
     if not same:
@@ -598,7 +624,7 @@ def write_stateful_ue(writer: BitWriter, state: StreamState, key: str, value: in
         state.params[key] = value
 
 
-def read_stateful_ue(reader: BitReader, state: StreamState, key: str, max_value: int) -> int:
+def read_stateful_ue(reader: BitReader, state: OpcodeState, key: str, max_value: int) -> int:
     same = bool(reader.read_bit())
     if same:
         if key not in state.params:
@@ -609,7 +635,7 @@ def read_stateful_ue(reader: BitReader, state: StreamState, key: str, max_value:
     return value
 
 
-def write_point(writer: BitWriter, state: StreamState, x: int, y: int) -> None:
+def write_point(writer: BitWriter, state: OpcodeState, x: int, y: int) -> None:
     x = clamp(x, 0, CANVAS_W - 1)
     y = clamp(y, 0, CANVAS_H - 1)
     if state.has_point:
@@ -631,11 +657,11 @@ def write_point(writer: BitWriter, state: StreamState, x: int, y: int) -> None:
     state.x, state.y, state.has_point = x, y, True
 
 
-def read_point(reader: BitReader, state: StreamState) -> Tuple[int, int]:
+def read_point(reader: BitReader, state: OpcodeState) -> Tuple[int, int]:
     use_delta = bool(reader.read_bit())
     if use_delta:
         if not state.has_point:
-            raise CodecError("Delta point referenced before an absolute point.")
+            raise CodecError("Delta point referenced before an opcode-local absolute point.")
         x = state.x + reader.read_rice_signed(3, max_abs=CANVAS_W * 2)
         y = state.y + reader.read_rice_signed(3, max_abs=CANVAS_H * 2)
     else:
@@ -697,30 +723,46 @@ def read_translation(reader: BitReader) -> Tuple[int, int]:
     return reader.read_bits(11) - 719, reader.read_bits(10) - 479
 
 
-def write_normal_opcode(writer: BitWriter, state: StreamState, opcode: int) -> None:
+def write_opcode_token(writer: BitWriter, state: StreamState, opcode: int, *, allow_special: bool = False) -> None:
     same = state.has_opcode and state.opcode == opcode
     writer.write_bit(same)
     if not same:
         writer.write_bits(opcode, 4)
+        if not allow_special and opcode == REPEAT_TRANSLATED_OPCODE:
+            raise CodecError("Special repeat opcode cannot be written as a normal command opcode.")
         state.opcode = opcode
         state.has_opcode = True
 
 
-def read_normal_opcode(reader: BitReader, state: StreamState) -> int:
+def read_opcode_token(reader: BitReader, state: StreamState, *, allow_special: bool = False) -> int:
     same = bool(reader.read_bit())
     if same:
         if not state.has_opcode:
             raise CodecError("Same-opcode flag used before opcode initialization.")
-        return state.opcode
-    opcode = reader.read_bits(4)
-    if opcode == REPEAT_TRANSLATED_OPCODE or opcode not in SHAPE_BY_OPCODE:
+        opcode = state.opcode
+    else:
+        opcode = reader.read_bits(4)
+        state.opcode = opcode
+        state.has_opcode = True
+
+    if opcode == REPEAT_TRANSLATED_OPCODE:
+        if allow_special:
+            return opcode
         raise CodecError(f"Invalid normal command opcode {opcode}.")
-    state.opcode = opcode
-    state.has_opcode = True
+    if opcode not in SHAPE_BY_OPCODE:
+        raise CodecError(f"Invalid normal command opcode {opcode}.")
     return opcode
 
 
-def write_color(writer: BitWriter, state: StreamState, color: int) -> None:
+def write_normal_opcode(writer: BitWriter, state: StreamState, opcode: int) -> None:
+    write_opcode_token(writer, state, opcode, allow_special=False)
+
+
+def read_normal_opcode(reader: BitReader, state: StreamState) -> int:
+    return read_opcode_token(reader, state, allow_special=False)
+
+
+def write_color(writer: BitWriter, state: OpcodeState, color: int) -> None:
     same = state.has_color and state.color == color
     writer.write_bit(same)
     if not same:
@@ -729,11 +771,11 @@ def write_color(writer: BitWriter, state: StreamState, color: int) -> None:
         state.has_color = True
 
 
-def read_color(reader: BitReader, state: StreamState) -> int:
+def read_color(reader: BitReader, state: OpcodeState) -> int:
     same = bool(reader.read_bit())
     if same:
         if not state.has_color:
-            raise CodecError("Same-color flag used before color initialization.")
+            raise CodecError("Same-color flag used before opcode-local color initialization.")
         return state.color
     color = reader.read_bits(6)
     if not 0 <= color < len(COLOR_TABLE):
@@ -743,17 +785,17 @@ def read_color(reader: BitReader, state: StreamState) -> int:
     return color
 
 
-def encode_command_fields(writer: BitWriter, state: StreamState, command: DrawCommand) -> None:
+def encode_command_fields(writer: BitWriter, local_state: OpcodeState, command: DrawCommand) -> None:
     f = command.fields
     op = command.opcode
 
     if op in {0x1, 0x2, 0xE}:
         x1, y1 = int(f["x1"]), int(f["y1"])
         x2, y2 = int(f["x2"]), int(f["y2"])
-        write_point(writer, state, x1, y1)
+        write_point(writer, local_state, x1, y1)
         write_relative_point(writer, x1, y1, x2, y2)
     else:
-        write_point(writer, state, int(f["x"]), int(f["y"]))
+        write_point(writer, local_state, int(f["x"]), int(f["y"]))
 
     if op == 0x0:
         text = clean_text(str(f.get("text", "")))
@@ -763,40 +805,40 @@ def encode_command_fields(writer: BitWriter, state: StreamState, command: DrawCo
     elif op == 0x1:
         pass
     elif op == 0x2:
-        write_stateful_fixed(writer, state, "fill", int(f["fill"]), 1)
+        write_stateful_fixed(writer, local_state, "fill", int(f["fill"]), 1)
     elif op == 0x3:
-        write_stateful_ue(writer, state, "radius_h", int(f["radius_h"]) - 1)
-        write_stateful_ue(writer, state, "radius_w", int(f["radius_w"]) - 1)
-        write_stateful_ue(writer, state, "scale", int(f["scale"]) - 1)
-        write_stateful_fixed(writer, state, "fill", int(f["fill"]), 1)
+        write_stateful_ue(writer, local_state, "radius_h", int(f["radius_h"]) - 1)
+        write_stateful_ue(writer, local_state, "radius_w", int(f["radius_w"]) - 1)
+        write_stateful_ue(writer, local_state, "scale", int(f["scale"]) - 1)
+        write_stateful_fixed(writer, local_state, "fill", int(f["fill"]), 1)
     elif op in {0x4, 0x5, 0x6, 0x9, 0xA, 0xB}:
-        write_stateful_fixed(writer, state, "orientation", int(f.get("orientation", 0)) % 4, 2)
-        write_stateful_ue(writer, state, "scale", int(f["scale"]) - 1)
+        write_stateful_fixed(writer, local_state, "orientation", int(f.get("orientation", 0)) % 4, 2)
+        write_stateful_ue(writer, local_state, "scale", int(f["scale"]) - 1)
     elif op == 0x7:
-        write_stateful_ue(writer, state, "radius", int(f["radius"]) - 1)
-        write_stateful_ue(writer, state, "scale", int(f["scale"]) - 1)
+        write_stateful_ue(writer, local_state, "radius", int(f["radius"]) - 1)
+        write_stateful_ue(writer, local_state, "scale", int(f["scale"]) - 1)
     elif op in {0x8, 0xC}:
-        write_stateful_ue(writer, state, "radius", int(f["radius"]) - 1)
-        write_stateful_ue(writer, state, "scale", int(f["scale"]) - 1)
-        write_stateful_fixed(writer, state, "start_angle", int(f["start_angle"]) % 361, 9)
-        write_stateful_fixed(writer, state, "arc_degrees", int(f["arc_degrees"]) % 361, 9)
+        write_stateful_ue(writer, local_state, "radius", int(f["radius"]) - 1)
+        write_stateful_ue(writer, local_state, "scale", int(f["scale"]) - 1)
+        write_stateful_fixed(writer, local_state, "start_angle", int(f["start_angle"]) % 361, 9)
+        write_stateful_fixed(writer, local_state, "arc_degrees", int(f["arc_degrees"]) % 361, 9)
     elif op == 0xD:
-        write_stateful_ue(writer, state, "scale", int(f["scale"]) - 1)
-        write_stateful_fixed(writer, state, "crater_color", int(f["crater_color"]), 6)
+        write_stateful_ue(writer, local_state, "scale", int(f["scale"]) - 1)
+        write_stateful_fixed(writer, local_state, "crater_color", int(f["crater_color"]), 6)
     elif op == 0xE:
-        write_stateful_ue(writer, state, "percent", int(f["percent"]))
+        write_stateful_ue(writer, local_state, "percent", int(f["percent"]))
     else:
         raise CodecError(f"Unsupported opcode {op}")
 
 
-def decode_command_fields(reader: BitReader, state: StreamState, opcode: int, color: int) -> DrawCommand:
+def decode_command_fields(reader: BitReader, local_state: OpcodeState, opcode: int, color: int) -> DrawCommand:
     fields: Dict[str, Any] = {}
     if opcode in {0x1, 0x2, 0xE}:
-        x1, y1 = read_point(reader, state)
+        x1, y1 = read_point(reader, local_state)
         x2, y2 = read_relative_point(reader, x1, y1)
         fields.update(x1=x1, y1=y1, x2=x2, y2=y2)
     else:
-        x, y = read_point(reader, state)
+        x, y = read_point(reader, local_state)
         fields.update(x=x, y=y)
 
     if opcode == 0x0:
@@ -811,31 +853,31 @@ def decode_command_fields(reader: BitReader, state: StreamState, opcode: int, co
     elif opcode == 0x1:
         pass
     elif opcode == 0x2:
-        fields["fill"] = read_stateful_fixed(reader, state, "fill", 1)
+        fields["fill"] = read_stateful_fixed(reader, local_state, "fill", 1)
     elif opcode == 0x3:
-        fields["radius_h"] = read_stateful_ue(reader, state, "radius_h", 127) + 1
-        fields["radius_w"] = read_stateful_ue(reader, state, "radius_w", 127) + 1
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-        fields["fill"] = read_stateful_fixed(reader, state, "fill", 1)
+        fields["radius_h"] = read_stateful_ue(reader, local_state, "radius_h", 127) + 1
+        fields["radius_w"] = read_stateful_ue(reader, local_state, "radius_w", 127) + 1
+        fields["scale"] = read_stateful_ue(reader, local_state, "scale", 63) + 1
+        fields["fill"] = read_stateful_fixed(reader, local_state, "fill", 1)
     elif opcode in {0x4, 0x5, 0x6, 0x9, 0xA, 0xB}:
-        fields["orientation"] = read_stateful_fixed(reader, state, "orientation", 2)
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
+        fields["orientation"] = read_stateful_fixed(reader, local_state, "orientation", 2)
+        fields["scale"] = read_stateful_ue(reader, local_state, "scale", 63) + 1
     elif opcode == 0x7:
-        fields["radius"] = read_stateful_ue(reader, state, "radius", 127) + 1
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
+        fields["radius"] = read_stateful_ue(reader, local_state, "radius", 127) + 1
+        fields["scale"] = read_stateful_ue(reader, local_state, "scale", 63) + 1
     elif opcode in {0x8, 0xC}:
-        fields["radius"] = read_stateful_ue(reader, state, "radius", 127) + 1
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-        fields["start_angle"] = read_stateful_fixed(reader, state, "start_angle", 9)
-        fields["arc_degrees"] = read_stateful_fixed(reader, state, "arc_degrees", 9)
+        fields["radius"] = read_stateful_ue(reader, local_state, "radius", 127) + 1
+        fields["scale"] = read_stateful_ue(reader, local_state, "scale", 63) + 1
+        fields["start_angle"] = read_stateful_fixed(reader, local_state, "start_angle", 9)
+        fields["arc_degrees"] = read_stateful_fixed(reader, local_state, "arc_degrees", 9)
     elif opcode == 0xD:
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-        crater_color = read_stateful_fixed(reader, state, "crater_color", 6)
+        fields["scale"] = read_stateful_ue(reader, local_state, "scale", 63) + 1
+        crater_color = read_stateful_fixed(reader, local_state, "crater_color", 6)
         if crater_color >= len(COLOR_TABLE):
             raise CodecError(f"Invalid crater color index {crater_color}.")
         fields["crater_color"] = crater_color
     elif opcode == 0xE:
-        fields["percent"] = read_stateful_ue(reader, state, "percent", 100)
+        fields["percent"] = read_stateful_ue(reader, local_state, "percent", 100)
     else:
         raise CodecError(f"Unsupported opcode {opcode}")
 
@@ -844,14 +886,14 @@ def decode_command_fields(reader: BitReader, state: StreamState, opcode: int, co
     return command
 
 
-def encode_commands_to_bits(commands: Sequence[DrawCommand]) -> Tuple[bytes, int, int]:
+def encode_commands_to_bits_v1(commands: Sequence[DrawCommand]) -> Tuple[bytes, int, int]:
     if len(commands) > MAX_EDITOR_COMMANDS:
         raise CodecError(f"Too many commands; editor safety limit is {MAX_EDITOR_COMMANDS}.")
 
     writer = BitWriter()
-    writer.write_bits(PROTOCOL_VERSION, 4)
+    writer.write_bits(1, 4)
     writer.write_ue(len(commands))
-    state = StreamState()
+    state = LegacyStreamState()
     repeat_count = 0
 
     for command in commands:
@@ -877,13 +919,76 @@ def encode_commands_to_bits(commands: Sequence[DrawCommand]) -> Tuple[bytes, int
     return writer.to_bytes(), writer.bit_count, repeat_count
 
 
-def decode_commands_from_bits(data: bytes) -> List[DrawCommand]:
-    reader = BitReader(data)
-    version = reader.read_bits(4)
-    if version != PROTOCOL_VERSION:
-        raise CodecError(f"Unsupported MCoreIMG bitstream version {version}.")
-    count = reader.read_ue(max_value=MAX_EDITOR_COMMANDS)
+def encode_commands_to_bits_v2(commands: Sequence[DrawCommand]) -> Tuple[bytes, int, int]:
+    if len(commands) > MAX_EDITOR_COMMANDS:
+        raise CodecError(f"Too many commands; editor safety limit is {MAX_EDITOR_COMMANDS}.")
+
+    writer = BitWriter()
+    writer.write_bits(BITSTREAM_VERSION, 4)
+    writer.write_ue(len(commands))
     state = StreamState()
+    repeat_count = 0
+
+    for command in commands:
+        validate_command(command)
+        local_state = get_opcode_state(state, command.opcode)
+        immediate_repeat_delta = translated_repeat_delta(state.previous_command, command)
+        opcode_local_repeat_delta = None
+        if immediate_repeat_delta is None:
+            opcode_local_repeat_delta = translated_repeat_delta(local_state.previous_command, command)
+
+        is_immediate_repeat = immediate_repeat_delta is not None
+        writer.write_bit(is_immediate_repeat)
+
+        if is_immediate_repeat:
+            assert immediate_repeat_delta is not None and state.previous_command is not None
+            write_translation(writer, immediate_repeat_delta[0], immediate_repeat_delta[1])
+            local_state.x, local_state.y = command_anchor(command)
+            local_state.has_point = True
+            local_state.has_color = True
+            local_state.color = command.color
+            state.previous_command = command.clone()
+            local_state.previous_command = command.clone()
+            repeat_count += 1
+            continue
+
+        if opcode_local_repeat_delta is not None:
+            assert local_state.previous_command is not None
+            write_opcode_token(writer, state, REPEAT_TRANSLATED_OPCODE, allow_special=True)
+            writer.write_bits(command.opcode, 4)
+            state.opcode = command.opcode
+            state.has_opcode = True
+            write_translation(writer, opcode_local_repeat_delta[0], opcode_local_repeat_delta[1])
+            local_state.x, local_state.y = command_anchor(command)
+            local_state.has_point = True
+            local_state.has_color = True
+            local_state.color = command.color
+            state.previous_command = command.clone()
+            local_state.previous_command = command.clone()
+            repeat_count += 1
+            continue
+
+        write_normal_opcode(writer, state, command.opcode)
+        write_color(writer, local_state, command.color)
+        encode_command_fields(writer, local_state, command)
+        state.previous_command = command.clone()
+        local_state.previous_command = command.clone()
+
+    return writer.to_bytes(), writer.bit_count, repeat_count
+
+
+def encode_commands_to_bits(commands: Sequence[DrawCommand]) -> Tuple[bytes, int, int]:
+    packed_v1, bits_v1, repeat_v1 = encode_commands_to_bits_v1(commands)
+    packed_v2, bits_v2, repeat_v2 = encode_commands_to_bits_v2(commands)
+
+    if bits_v2 < bits_v1:
+        return packed_v2, bits_v2, repeat_v2
+    return packed_v1, bits_v1, repeat_v1
+
+
+def decode_commands_from_bits_v1(reader: BitReader) -> List[DrawCommand]:
+    count = reader.read_ue(max_value=MAX_EDITOR_COMMANDS)
+    state = LegacyStreamState()
     commands: List[DrawCommand] = []
 
     for _ in range(count):
@@ -907,6 +1012,72 @@ def decode_commands_from_bits(data: bytes) -> List[DrawCommand]:
         commands.append(command)
 
     return commands
+
+
+def decode_commands_from_bits_v2(reader: BitReader) -> List[DrawCommand]:
+    count = reader.read_ue(max_value=MAX_EDITOR_COMMANDS)
+    state = StreamState()
+    commands: List[DrawCommand] = []
+
+    for _ in range(count):
+        is_immediate_repeat = bool(reader.read_bit())
+        if is_immediate_repeat:
+            if state.previous_command is None:
+                raise CodecError("Translated-repeat command has no previous command.")
+            dx, dy = read_translation(reader)
+            command = translated_clone(state.previous_command, dx, dy)
+            validate_command(command)
+            local_state = get_opcode_state(state, command.opcode)
+            local_state.x, local_state.y = command_anchor(command)
+            local_state.has_point = True
+            local_state.has_color = True
+            local_state.color = command.color
+            local_state.previous_command = command.clone()
+            state.previous_command = command.clone()
+            commands.append(command)
+            continue
+
+        opcode_token = read_opcode_token(reader, state, allow_special=True)
+        if opcode_token == REPEAT_TRANSLATED_OPCODE:
+            opcode = reader.read_bits(4)
+            if opcode not in SHAPE_BY_OPCODE:
+                raise CodecError(f"Invalid opcode-local repeat source opcode {opcode}.")
+            state.opcode = opcode
+            state.has_opcode = True
+            local_state = get_opcode_state(state, opcode)
+            if local_state.previous_command is None:
+                raise CodecError(f"Translated-repeat for opcode {opcode:X} has no opcode-local reference command.")
+            dx, dy = read_translation(reader)
+            command = translated_clone(local_state.previous_command, dx, dy)
+            validate_command(command)
+            local_state.x, local_state.y = command_anchor(command)
+            local_state.has_point = True
+            local_state.has_color = True
+            local_state.color = command.color
+            local_state.previous_command = command.clone()
+            state.previous_command = command.clone()
+            commands.append(command)
+            continue
+
+        opcode = opcode_token
+        local_state = get_opcode_state(state, opcode)
+        color = read_color(reader, local_state)
+        command = decode_command_fields(reader, local_state, opcode, color)
+        local_state.previous_command = command.clone()
+        state.previous_command = command.clone()
+        commands.append(command)
+
+    return commands
+
+
+def decode_commands_from_bits(data: bytes) -> List[DrawCommand]:
+    reader = BitReader(data)
+    version = reader.read_bits(4)
+    if version == 1:
+        return decode_commands_from_bits_v1(reader)
+    if version == 2:
+        return decode_commands_from_bits_v2(reader)
+    raise CodecError(f"Unsupported MCoreIMG bitstream version {version}.")
 
 
 # ---------------------------------------------------------------------------
@@ -1549,7 +1720,7 @@ def save_source(path: str | os.PathLike[str], commands: Sequence[DrawCommand], g
     document = {
         "format": SOURCE_FORMAT,
         "version": SOURCE_VERSION,
-        "protocol_version": PROTOCOL_VERSION,
+        "protocol_version": BITSTREAM_VERSION,
         "canvas": {"width": CANVAS_W, "height": CANVAS_H},
         "metadata": {"grid": validate_grid_locator(grid)},
         "commands": [command.to_json() for command in commands],

@@ -1,1451 +1,544 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-MCoreIMG Reconstructor — compressed MeshCore image decoder
-==========================================================
+MCoreIMG SVG Reconstructor — protocol-aware alpha build
+=======================================================
 
-Decodes transport files exported by MCoreIMG-Constructor.py and renders the
-reconstructed 720 x 480 image as PNG.
+Reconstructs protocol-v2 and protocol-v3 MCoreIMG SVG/vector transports.
+The matching Constructor is loaded as the codec/rendering core so every shape,
+path, compression, palette, alpha, and rendering feature stays synchronized.
 
-Compatible transport profile
-----------------------------
-* One to five MeshCore text frames.
-* Maximum 150 ASCII characters per frame.
-* 15-character MCI control header plus up to 135 Base91 payload characters.
-* Per-frame CRC-16 and assembled-stream CRC-32 validation.
-* Stateful opcode/color/parameter decoding.
-* Absolute or predictive coordinate decoding.
-* ZigZag + Golomb-Rice signed deltas.
-* Unsigned Exp-Golomb variable integers.
-* Translated-repeat macro expansion.
+Protocol 3 synchronization includes:
+* RGB565+A4 palette entries.
+* RGBA PNG output and source-over alpha compositing.
+* Ten-message MeshCore transport envelope.
+* SVG paths, open-subpath filling, nested transforms, predictive coordinates,
+  opcode-local state, and nonadjacent translated-repeat references.
 
-Usage
------
-    python MCoreIMG-Reconstructor.py image.mci
-    python MCoreIMG-Reconstructor.py image.mci --output reconstructed.png
-    python MCoreIMG-Reconstructor.py image.mci --dump-json
-
-With no input path, a graphical file chooser is opened.
-
-Arch Linux dependencies
------------------------
-    sudo pacman -Syu tk python-pillow
+Put this file beside MCoreIMG-Constructor.py (or a versioned SVG Constructor),
+or use --core to specify it explicitly.
 """
 
 import argparse
-import binascii
-import copy
+import importlib.util
 import json
-import math
 import os
+import re
+import subprocess
 import sys
-import tkinter as tk
-import zlib
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from types import ModuleType
+from typing import Any, Iterable, Optional, Sequence
 
-try:
-    from PIL import Image, ImageDraw
-except ImportError as exc:  # pragma: no cover - environment dependent
-    raise SystemExit(
-        "Pillow is required. Install it with: sudo pacman -S python-pillow"
-    ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Protocol constants — must match MCoreIMG-Constructor.py
-# ---------------------------------------------------------------------------
-
-CANVAS_W = 720
-CANVAS_H = 480
-BACKGROUND = "#FFFFFF"
-
-PROTOCOL_NAME = "MCoreIMG"
-PROTOCOL_VERSION = 1
-SOURCE_FORMAT = "MCoreIMG-source"
-SOURCE_VERSION = 1
-DEFAULT_GRID = "EN60"  # source metadata only; not transmitted
-
-MAX_MESSAGES = 5
-MESSAGE_LEN = 150
-FRAME_HEADER_LEN = 15
-FRAME_PAYLOAD_LEN = MESSAGE_LEN - FRAME_HEADER_LEN
-FRAME_MAGIC = "MCI"
-
+RECONSTRUCTOR_BUILD = "2026.07.31-svg-v3.3-alpha-protocol-aware-FIXED"
+SUPPORTED_PROTOCOL_VERSIONS = (2, 3)
+PREFERRED_PROTOCOL_VERSION = 3
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-# Printable ASCII ! through ~, excluding quote, apostrophe, and backslash.
-BASE91 = "".join(
-    chr(code)
-    for code in range(33, 127)
-    if chr(code) not in {'"', "'", "\\"}
+PREFERRED_CORE_FILENAMES = (
+    "MCoreIMG-SVG-Constructor-v3.3-ALPHA-ROUNDTRIP.py",
+    "MCoreIMG-SVG-Constructor.py",
+    "MCoreIMG-Constructor.py",
 )
-assert len(BASE91) == 91
-BASE91_INDEX = {ch: i for i, ch in enumerate(BASE91)}
-
-TEXT_ALPHABET = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-+./?:,()[]#_=@"
-assert len(TEXT_ALPHABET) <= 64
-MAX_TEXT_LEN = 31
-MAX_EDITOR_COMMANDS = 512
-
-COLOR_TABLE: List[Tuple[str, str, str]] = [
-    ("0", "Black", "#000000"),
-    ("1", "White", "#FFFFFF"),
-    ("2", "Gray", "#808080"),
-    ("3", "Red", "#FF0000"),
-    ("4", "Green", "#00A000"),
-    ("5", "Blue", "#0000FF"),
-    ("6", "Yellow", "#FFFF00"),
-    ("7", "Cyan", "#00FFFF"),
-    ("8", "Magenta", "#FF00FF"),
-    ("9", "Brown", "#8B4513"),
-    ("A", "Tan", "#D2B48C"),
-    ("B", "Beige", "#F5F5DC"),
-    ("C", "Wheat", "#F5DEB3"),
-    ("D", "Sandybrown", "#F4A460"),
-    ("E", "Sienna", "#A0522D"),
-    ("F", "Chocolate", "#D2691E"),
-    ("G", "Gold", "#FFD700"),
-    ("H", "Crimson", "#DC143C"),
-    ("I", "Indigo", "#4B0082"),
-    ("J", "Hotpink", "#FF69B4"),
-    ("K", "Orange", "#FFA500"),
-    ("L", "Purple", "#800080"),
-    ("M", "Lime", "#00FF00"),
-    ("N", "Aliceblue", "#F0F8FF"),
-    ("O", "Ivory", "#FFFFF0"),
-    ("P", "Lavender", "#E6E6FA"),
-    ("Q", "Mistyrose", "#FFE4E1"),
-    ("R", "Papayawhip", "#FFEFD5"),
-    ("S", "Seashell", "#FFF5EE"),
-    ("T", "Silver", "#C0C0C0"),
-    ("U", "Lightgray", "#D3D3D3"),
-    ("V", "Darkslategray", "#2F4F4F"),
-    ("W", "Dimgray", "#696969"),
-]
-COLOR_HEX = [item[2] for item in COLOR_TABLE]
+CORE_GLOB_PATTERNS = (
+    "MCoreIMG-SVG-Constructor*.py",
+    "MCoreIMG-Constructor*.py",
+)
+FRAME_TOKEN_RE = re.compile(r"MCI[!-~]{12,147}")
 
 
-@dataclass(frozen=True)
-class ShapeDef:
-    opcode: int
-    code: str
-    name: str
-
-
-SHAPES: List[ShapeDef] = [
-    ShapeDef(0x0, "0", "Text"),
-    ShapeDef(0x1, "1", "Line"),
-    ShapeDef(0x2, "2", "Rectangle"),
-    ShapeDef(0x3, "3", "Ellipse"),
-    ShapeDef(0x4, "4", "Triangle Outline"),
-    ShapeDef(0x5, "5", "Triangle Fill"),
-    ShapeDef(0x6, "6", "Arrow"),
-    ShapeDef(0x7, "7", "Star"),
-    ShapeDef(0x8, "8", "SemiCircle / Arc"),
-    ShapeDef(0x9, "9", "Yagi Antenna"),
-    ShapeDef(0xA, "A", "Dish Antenna"),
-    ShapeDef(0xB, "B", "Radio Transceiver"),
-    ShapeDef(0xC, "C", "Radio Waves"),
-    ShapeDef(0xD, "D", "Moon"),
-    ShapeDef(0xE, "E", "DoubleBox"),
-]
-SHAPE_BY_OPCODE = {shape.opcode: shape for shape in SHAPES}
-REPEAT_TRANSLATED_OPCODE = 0xF
-
-
-class CodecError(ValueError):
+class ReconstructorError(RuntimeError):
     pass
 
 
-class FrameError(CodecError):
-    pass
+def decode_base62_digit(ch: str) -> int:
+    if len(ch) != 1 or ch not in BASE62:
+        raise ReconstructorError(f"Invalid Base62 protocol character: {ch!r}")
+    return BASE62.index(ch)
 
 
-@dataclass
-class DrawCommand:
-    opcode: int
-    color: int
-    fields: Dict[str, Any] = field(default_factory=dict)
+def frame_protocol_version(frame: str) -> int:
+    frame = frame.strip()
+    if len(frame) < 4 or not frame.startswith("MCI"):
+        raise ReconstructorError("Cannot determine protocol version from malformed MCI frame.")
+    return decode_base62_digit(frame[3])
 
-    def clone(self) -> "DrawCommand":
-        return DrawCommand(self.opcode, self.color, copy.deepcopy(self.fields))
 
-    @property
-    def shape(self) -> ShapeDef:
+def _unique_paths(paths: Iterable[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
         try:
-            return SHAPE_BY_OPCODE[self.opcode]
-        except KeyError as exc:
-            raise CodecError(f"Unknown opcode {self.opcode}.") from exc
-
-    def to_json(self) -> Dict[str, Any]:
-        return {
-            "opcode": self.opcode,
-            "shape": self.shape.code,
-            "color": self.color,
-            "fields": copy.deepcopy(self.fields),
-        }
-
-
-@dataclass
-class StreamState:
-    has_point: bool = False
-    x: int = 0
-    y: int = 0
-    has_opcode: bool = False
-    opcode: int = 0
-    has_color: bool = False
-    color: int = 0
-    params: Dict[str, int] = field(default_factory=dict)
-    previous_command: Optional[DrawCommand] = None
-
-
-# ---------------------------------------------------------------------------
-# General helpers
-# ---------------------------------------------------------------------------
-
-
-def clamp(value: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, int(value)))
-
-
-def decode_base62(text: str) -> int:
-    value = 0
-    for ch in text:
-        try:
-            digit = BASE62.index(ch)
-        except ValueError as exc:
-            raise FrameError(f"Invalid Base62 character {ch!r}.") from exc
-        value = value * len(BASE62) + digit
-    return value
-
-
-def command_anchor(command: DrawCommand) -> Tuple[int, int]:
-    fields = command.fields
-    if "x" in fields and "y" in fields:
-        return int(fields["x"]), int(fields["y"])
-    return int(fields["x1"]), int(fields["y1"])
-
-
-def coordinate_keys(command: DrawCommand) -> List[Tuple[str, str]]:
-    if command.opcode in {0x1, 0x2, 0xE}:
-        return [("x1", "y1"), ("x2", "y2")]
-    return [("x", "y")]
-
-
-def translated_clone(command: DrawCommand, dx: int, dy: int) -> DrawCommand:
-    result = command.clone()
-    for x_key, y_key in coordinate_keys(result):
-        result.fields[x_key] = clamp(int(result.fields[x_key]) + dx, 0, CANVAS_W - 1)
-        result.fields[y_key] = clamp(int(result.fields[y_key]) + dy, 0, CANVAS_H - 1)
+            resolved = path.expanduser().resolve()
+        except OSError:
+            resolved = path.expanduser().absolute()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
     return result
 
 
-# ---------------------------------------------------------------------------
-# Bit-level decoder
-# ---------------------------------------------------------------------------
-
-
-class BitReader:
-    def __init__(self, data: bytes) -> None:
-        self.data = data
-        self.bit_pos = 0
-
-    def remaining(self) -> int:
-        return len(self.data) * 8 - self.bit_pos
-
-    def read_bit(self) -> int:
-        if self.remaining() < 1:
-            raise CodecError("Unexpected end of compressed bitstream.")
-        byte = self.data[self.bit_pos // 8]
-        bit = (byte >> (7 - (self.bit_pos % 8))) & 1
-        self.bit_pos += 1
-        return bit
-
-    def read_bits(self, width: int) -> int:
-        if width < 0 or self.remaining() < width:
-            raise CodecError("Unexpected end of compressed bitstream.")
-        value = 0
-        for _ in range(width):
-            value = (value << 1) | self.read_bit()
-        return value
-
-    def read_ue(self, max_value: int = 1_000_000) -> int:
-        zeros = 0
-        while self.read_bit() == 0:
-            zeros += 1
-            if zeros > 31:
-                raise CodecError("Exp-Golomb prefix is unreasonably long.")
-        suffix = self.read_bits(zeros) if zeros else 0
-        value = (1 << zeros) + suffix - 1
-        if value > max_value:
-            raise CodecError(f"Decoded Exp-Golomb value {value} exceeds limit.")
-        return value
-
-    def read_rice_unsigned(self, k: int, max_value: int = 1_000_000) -> int:
-        quotient = 0
-        while self.read_bit() == 1:
-            quotient += 1
-            if quotient > 4096:
-                raise CodecError("Rice quotient is unreasonably long.")
-        remainder = self.read_bits(k) if k else 0
-        value = (quotient << k) | remainder
-        if value > max_value:
-            raise CodecError(f"Decoded Rice value {value} exceeds limit.")
-        return value
-
-    def read_rice_signed(self, k: int, max_abs: int = 10_000) -> int:
-        zigzag = self.read_rice_unsigned(k, max_value=max_abs * 2 + 1)
-        value = -(zigzag // 2) - 1 if zigzag & 1 else zigzag // 2
-        if abs(value) > max_abs:
-            raise CodecError(f"Decoded signed Rice value {value} exceeds limit.")
-        return value
-
-
-def read_stateful_fixed(
-    reader: BitReader,
-    state: StreamState,
-    key: str,
-    width: int,
-) -> int:
-    same = bool(reader.read_bit())
-    if same:
-        if key not in state.params:
-            raise CodecError(f"Stateful field {key!r} referenced before initialization.")
-        return state.params[key]
-    value = reader.read_bits(width)
-    state.params[key] = value
-    return value
-
-
-def read_stateful_ue(
-    reader: BitReader,
-    state: StreamState,
-    key: str,
-    max_value: int,
-) -> int:
-    same = bool(reader.read_bit())
-    if same:
-        if key not in state.params:
-            raise CodecError(f"Stateful field {key!r} referenced before initialization.")
-        return state.params[key]
-    value = reader.read_ue(max_value=max_value)
-    state.params[key] = value
-    return value
-
-
-def read_point(reader: BitReader, state: StreamState) -> Tuple[int, int]:
-    use_delta = bool(reader.read_bit())
-    if use_delta:
-        if not state.has_point:
-            raise CodecError("Delta point referenced before an absolute point.")
-        x = state.x + reader.read_rice_signed(3, max_abs=CANVAS_W * 2)
-        y = state.y + reader.read_rice_signed(3, max_abs=CANVAS_H * 2)
-    else:
-        x = reader.read_bits(10)
-        y = reader.read_bits(9)
-
-    if not (0 <= x < CANVAS_W and 0 <= y < CANVAS_H):
-        raise CodecError(f"Decoded point ({x}, {y}) is outside the canvas.")
-
-    state.x = x
-    state.y = y
-    state.has_point = True
-    return x, y
-
-
-def read_relative_point(reader: BitReader, x1: int, y1: int) -> Tuple[int, int]:
-    use_delta = bool(reader.read_bit())
-    if use_delta:
-        x2 = x1 + reader.read_rice_signed(3, max_abs=CANVAS_W * 2)
-        y2 = y1 + reader.read_rice_signed(3, max_abs=CANVAS_H * 2)
-    else:
-        x2 = reader.read_bits(10)
-        y2 = reader.read_bits(9)
-
-    if not (0 <= x2 < CANVAS_W and 0 <= y2 < CANVAS_H):
-        raise CodecError(f"Decoded second point ({x2}, {y2}) is outside the canvas.")
-    return x2, y2
-
-
-def read_translation(reader: BitReader) -> Tuple[int, int]:
-    use_rice = bool(reader.read_bit())
-    if use_rice:
-        return (
-            reader.read_rice_signed(2, max_abs=719),
-            reader.read_rice_signed(2, max_abs=479),
-        )
-    return reader.read_bits(11) - 719, reader.read_bits(10) - 479
-
-
-def read_normal_opcode(reader: BitReader, state: StreamState) -> int:
-    same = bool(reader.read_bit())
-    if same:
-        if not state.has_opcode:
-            raise CodecError("Same-opcode flag used before opcode initialization.")
-        return state.opcode
-
-    opcode = reader.read_bits(4)
-    if opcode == REPEAT_TRANSLATED_OPCODE or opcode not in SHAPE_BY_OPCODE:
-        raise CodecError(f"Invalid normal command opcode {opcode}.")
-    state.opcode = opcode
-    state.has_opcode = True
-    return opcode
-
-
-def read_color(reader: BitReader, state: StreamState) -> int:
-    same = bool(reader.read_bit())
-    if same:
-        if not state.has_color:
-            raise CodecError("Same-color flag used before color initialization.")
-        return state.color
-
-    color = reader.read_bits(6)
-    if not 0 <= color < len(COLOR_TABLE):
-        raise CodecError(f"Decoded invalid color index {color}.")
-    state.color = color
-    state.has_color = True
-    return color
-
-
-def decode_command_fields(
-    reader: BitReader,
-    state: StreamState,
-    opcode: int,
-    color: int,
-) -> DrawCommand:
-    fields: Dict[str, Any] = {}
-
-    if opcode in {0x1, 0x2, 0xE}:
-        x1, y1 = read_point(reader, state)
-        x2, y2 = read_relative_point(reader, x1, y1)
-        fields.update(x1=x1, y1=y1, x2=x2, y2=y2)
-    else:
-        x, y = read_point(reader, state)
-        fields.update(x=x, y=y)
-
-    if opcode == 0x0:
-        length = reader.read_ue(max_value=MAX_TEXT_LEN)
-        chars: List[str] = []
-        for _ in range(length):
-            index = reader.read_bits(6)
-            if index >= len(TEXT_ALPHABET):
-                raise CodecError(f"Invalid text symbol index {index}.")
-            chars.append(TEXT_ALPHABET[index])
-        fields["text"] = "".join(chars)
-    elif opcode == 0x1:
-        pass
-    elif opcode == 0x2:
-        fields["fill"] = read_stateful_fixed(reader, state, "fill", 1)
-    elif opcode == 0x3:
-        fields["radius_h"] = read_stateful_ue(reader, state, "radius_h", 127) + 1
-        fields["radius_w"] = read_stateful_ue(reader, state, "radius_w", 127) + 1
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-        fields["fill"] = read_stateful_fixed(reader, state, "fill", 1)
-    elif opcode in {0x4, 0x5, 0x6, 0x9, 0xA, 0xB}:
-        fields["orientation"] = read_stateful_fixed(reader, state, "orientation", 2)
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-    elif opcode == 0x7:
-        fields["radius"] = read_stateful_ue(reader, state, "radius", 127) + 1
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-    elif opcode in {0x8, 0xC}:
-        fields["radius"] = read_stateful_ue(reader, state, "radius", 127) + 1
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-        fields["start_angle"] = read_stateful_fixed(reader, state, "start_angle", 9)
-        fields["arc_degrees"] = read_stateful_fixed(reader, state, "arc_degrees", 9)
-    elif opcode == 0xD:
-        fields["scale"] = read_stateful_ue(reader, state, "scale", 63) + 1
-        crater_color = read_stateful_fixed(reader, state, "crater_color", 6)
-        if crater_color >= len(COLOR_TABLE):
-            raise CodecError(f"Invalid crater color index {crater_color}.")
-        fields["crater_color"] = crater_color
-    elif opcode == 0xE:
-        fields["percent"] = read_stateful_ue(reader, state, "percent", 100)
-    else:  # pragma: no cover - opcode checked earlier
-        raise CodecError(f"Unsupported opcode {opcode}.")
-
-    command = DrawCommand(opcode, color, fields)
-    validate_command(command)
-    return command
-
-
-def decode_commands_from_bits(data: bytes) -> List[DrawCommand]:
-    reader = BitReader(data)
-    version = reader.read_bits(4)
-    if version != PROTOCOL_VERSION:
-        raise CodecError(f"Unsupported MCoreIMG bitstream version {version}.")
-
-    count = reader.read_ue(max_value=MAX_EDITOR_COMMANDS)
-    state = StreamState()
-    commands: List[DrawCommand] = []
-
-    for command_index in range(count):
-        try:
-            is_repeat = bool(reader.read_bit())
-            if is_repeat:
-                if state.previous_command is None:
-                    raise CodecError("Translated-repeat command has no previous command.")
-                dx, dy = read_translation(reader)
-                command = translated_clone(state.previous_command, dx, dy)
-                validate_command(command)
-                state.x, state.y = command_anchor(command)
-                state.has_point = True
-                state.previous_command = command.clone()
-                commands.append(command)
-                continue
-
-            opcode = read_normal_opcode(reader, state)
-            color = read_color(reader, state)
-            command = decode_command_fields(reader, state, opcode, color)
-            state.previous_command = command.clone()
-            commands.append(command)
-        except CodecError as exc:
-            raise CodecError(f"Command {command_index}: {exc}") from exc
-
-    return commands
-
-
-# ---------------------------------------------------------------------------
-# Base91 and MeshCore frame layer
-# ---------------------------------------------------------------------------
-
-
-def base91_decode(text: str) -> bytes:
-    accumulator = 0
-    bit_count = 0
-    value = -1
-    output = bytearray()
-
-    for ch in text:
-        if ch not in BASE91_INDEX:
-            raise CodecError(f"Invalid Base91 character {ch!r}.")
-        digit = BASE91_INDEX[ch]
-        if value < 0:
-            value = digit
-        else:
-            value += digit * 91
-            accumulator |= value << bit_count
-            if value & 8191 > 88:
-                bit_count += 13
-            else:
-                bit_count += 14
-            while bit_count >= 8:
-                output.append(accumulator & 255)
-                accumulator >>= 8
-                bit_count -= 8
-            value = -1
-
-    if value >= 0:
-        accumulator |= value << bit_count
-        bit_count += 7
-        while bit_count >= 8:
-            output.append(accumulator & 255)
-            accumulator >>= 8
-            bit_count -= 8
-
-    return bytes(output)
-
-
-def frame_crc(payload: str) -> int:
-    return binascii.crc_hqx(payload.encode("ascii"), 0xFFFF)
-
-
-def parse_frame(frame: str) -> Dict[str, Any]:
-    frame = frame.rstrip("\r\n")
-    if len(frame) < FRAME_HEADER_LEN:
-        raise FrameError("Frame is shorter than the 15-character control header.")
-    if len(frame) > MESSAGE_LEN:
-        raise FrameError(f"Frame exceeds {MESSAGE_LEN} characters.")
-
-    header = frame[:FRAME_HEADER_LEN]
-    payload = frame[FRAME_HEADER_LEN:]
-
-    if header[:3] != FRAME_MAGIC:
-        raise FrameError("Frame does not begin with MCI.")
-
-    version = decode_base62(header[3])
-    if version != PROTOCOL_VERSION:
-        raise FrameError(f"Unsupported frame version {version}.")
-
-    image_id = header[4:7]
-    if len(image_id) != 3 or any(ch not in BASE62 for ch in image_id):
-        raise FrameError("Frame contains an invalid image ID.")
-
-    part_index = decode_base62(header[7])
-    total_parts = decode_base62(header[8])
-    payload_length = decode_base62(header[9:11])
-    expected_crc = decode_base62(header[11:14])
-    flags = decode_base62(header[14])
-
-    if payload_length != len(payload):
-        raise FrameError(
-            f"Frame payload length mismatch: header says {payload_length}, "
-            f"received {len(payload)}."
-        )
-    if payload_length > FRAME_PAYLOAD_LEN:
-        raise FrameError(f"Frame payload exceeds {FRAME_PAYLOAD_LEN} characters.")
-    if any(ch not in BASE91_INDEX for ch in payload):
-        raise FrameError("Frame payload contains a character outside the MCoreIMG Base91 alphabet.")
-
-    actual_crc = frame_crc(payload)
-    if expected_crc != actual_crc:
-        raise FrameError(
-            "Frame CRC-16 mismatch; request retransmission of this part."
-        )
-
-    if not 0 <= part_index < total_parts <= MAX_MESSAGES:
-        raise FrameError("Invalid frame part/total values.")
-
-    return {
-        "image_id": image_id,
-        "part_index": part_index,
-        "total_parts": total_parts,
-        "payload": payload,
-        "flags": flags,
-    }
-
-
-def assemble_frames(frames: Iterable[str]) -> Tuple[str, bytes, int]:
-    parsed: List[Dict[str, Any]] = []
-    for line_number, frame in enumerate(frames, start=1):
-        if not frame.strip():
-            continue
-        try:
-            parsed.append(parse_frame(frame))
-        except FrameError as exc:
-            raise FrameError(f"Frame line {line_number}: {exc}") from exc
-
-    if not parsed:
-        raise FrameError("No MCoreIMG frames found.")
-
-    image_ids = {item["image_id"] for item in parsed}
-    totals = {item["total_parts"] for item in parsed}
-    if len(image_ids) != 1 or len(totals) != 1:
-        raise FrameError("Frames belong to different images or disagree on total parts.")
-
-    image_id = next(iter(image_ids))
-    total = next(iter(totals))
-    parts: Dict[int, str] = {}
-    duplicate_count = 0
-
-    for item in parsed:
-        index = item["part_index"]
-        if index in parts:
-            if parts[index] != item["payload"]:
-                raise FrameError(f"Conflicting duplicates for frame part {index}.")
-            duplicate_count += 1
-            continue
-        parts[index] = item["payload"]
-
-    missing = [index for index in range(total) if index not in parts]
-    if missing:
-        missing_text = ", ".join(str(index) for index in missing)
-        raise FrameError(f"Missing frame part(s): {missing_text}.")
-
-    payload = "".join(parts[index] for index in range(total))
-    raw_with_crc = base91_decode(payload)
-    if len(raw_with_crc) < 4:
-        raise CodecError("Assembled stream is too short for CRC-32.")
-
-    raw = raw_with_crc[:-4]
-    expected_crc = int.from_bytes(raw_with_crc[-4:], "big")
-    actual_crc = zlib.crc32(raw) & 0xFFFFFFFF
-    if expected_crc != actual_crc:
-        raise CodecError("Assembled stream CRC-32 mismatch.")
-
-    return image_id, raw, duplicate_count
-
-
-def decode_image_frames(frames: Iterable[str]) -> Tuple[str, List[DrawCommand], int]:
-    image_id, packed, duplicate_count = assemble_frames(frames)
-    return image_id, decode_commands_from_bits(packed), duplicate_count
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
-
-
-def _require_int(fields: Dict[str, Any], key: str, lo: int, hi: int) -> int:
-    if key not in fields:
-        raise CodecError(f"Command is missing field {key!r}.")
+def _candidate_core_paths(explicit: Optional[str]) -> list[Path]:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+
+    script_path = Path(__file__).resolve()
+    directories = _unique_paths((script_path.parent, Path.cwd()))
+    for directory in directories:
+        for filename in PREFERRED_CORE_FILENAMES:
+            candidates.append(directory / filename)
+        for pattern in CORE_GLOB_PATTERNS:
+            candidates.extend(sorted(directory.glob(pattern)))
+
+    return [
+        path for path in _unique_paths(candidates)
+        if path != script_path and "reconstructor" not in path.name.lower()
+    ]
+
+
+def _import_core(path: Path) -> ModuleType:
+    module_name = f"_mcoreimg_svg_core_{abs(hash(path.resolve()))}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError("Python could not create an import specification.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     try:
-        value = int(fields[key])
-    except (TypeError, ValueError) as exc:
-        raise CodecError(f"Command field {key!r} must be an integer.") from exc
-    if not lo <= value <= hi:
-        raise CodecError(f"Command field {key!r}={value} must be {lo}..{hi}.")
-    fields[key] = value
-    return value
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
-def validate_command(command: DrawCommand) -> None:
-    if command.opcode not in SHAPE_BY_OPCODE:
-        raise CodecError(f"Unknown command opcode {command.opcode}.")
-    if not 0 <= int(command.color) < len(COLOR_TABLE):
-        raise CodecError(f"Invalid color index {command.color}.")
+def load_constructor_core(
+    explicit: Optional[str] = None,
+    required_protocol: Optional[int] = None,
+) -> tuple[ModuleType, Path]:
+    """Load a matching Constructor core; protocol 3 is preferred by default."""
+    failures: list[str] = []
+    accepted: list[tuple[int, int, ModuleType, Path]] = []
 
-    fields = command.fields
-    opcode = command.opcode
-
-    if opcode in {0x1, 0x2, 0xE}:
-        _require_int(fields, "x1", 0, CANVAS_W - 1)
-        _require_int(fields, "y1", 0, CANVAS_H - 1)
-        _require_int(fields, "x2", 0, CANVAS_W - 1)
-        _require_int(fields, "y2", 0, CANVAS_H - 1)
-    else:
-        _require_int(fields, "x", 0, CANVAS_W - 1)
-        _require_int(fields, "y", 0, CANVAS_H - 1)
-
-    if opcode == 0x0:
-        text = str(fields.get("text", "")).upper()[:MAX_TEXT_LEN]
-        fields["text"] = "".join(ch if ch in TEXT_ALPHABET else " " for ch in text).rstrip()
-    elif opcode == 0x2:
-        _require_int(fields, "fill", 0, 1)
-    elif opcode == 0x3:
-        _require_int(fields, "radius_h", 1, 128)
-        _require_int(fields, "radius_w", 1, 128)
-        _require_int(fields, "scale", 1, 64)
-        _require_int(fields, "fill", 0, 1)
-    elif opcode in {0x4, 0x5, 0x6, 0x9, 0xA, 0xB}:
-        _require_int(fields, "orientation", 0, 3)
-        _require_int(fields, "scale", 1, 64)
-    elif opcode == 0x7:
-        _require_int(fields, "radius", 1, 128)
-        _require_int(fields, "scale", 1, 64)
-    elif opcode in {0x8, 0xC}:
-        _require_int(fields, "radius", 1, 128)
-        _require_int(fields, "scale", 1, 64)
-        _require_int(fields, "start_angle", 0, 360)
-        _require_int(fields, "arc_degrees", 0, 360)
-    elif opcode == 0xD:
-        _require_int(fields, "scale", 1, 64)
-        _require_int(fields, "crater_color", 0, len(COLOR_TABLE) - 1)
-    elif opcode == 0xE:
-        _require_int(fields, "percent", 0, 100)
-
-
-# ---------------------------------------------------------------------------
-# Rendering — mirrors the current constructor geometry
-# ---------------------------------------------------------------------------
-
-
-def rotate_point(
-    px: float,
-    py: float,
-    origin_x: float,
-    origin_y: float,
-    orientation: int,
-) -> Tuple[int, int]:
-    dx = px - origin_x
-    dy = py - origin_y
-    orientation %= 4
-    if orientation == 0:
-        rx, ry = dx, dy
-    elif orientation == 1:
-        rx, ry = -dy, dx
-    elif orientation == 2:
-        rx, ry = -dx, -dy
-    else:
-        rx, ry = dy, -dx
-    return round(origin_x + rx), round(origin_y + ry)
-
-
-def polygon_regular(
-    center_x: int,
-    center_y: int,
-    radius: int,
-    sides: int,
-    rotation_degrees: float,
-) -> List[Tuple[int, int]]:
-    points: List[Tuple[int, int]] = []
-    for index in range(sides):
-        angle = math.radians(rotation_degrees + index * 360.0 / sides)
-        points.append(
-            (
-                round(center_x + radius * math.cos(angle)),
-                round(center_y + radius * math.sin(angle)),
-            )
-        )
-    return points
-
-
-def draw_line(
-    draw: ImageDraw.ImageDraw,
-    point1: Tuple[float, float],
-    point2: Tuple[float, float],
-    color: str,
-    width: int = 2,
-) -> None:
-    draw.line([point1, point2], fill=color, width=width)
-
-
-def draw_arrow(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    orientation: int,
-    scale: int,
-    fill: str,
-) -> None:
-    scale = max(1, scale)
-    points = [
-        (x, y),
-        (x - 8 * scale, y + 18 * scale),
-        (x - 3 * scale, y + 18 * scale),
-        (x - 3 * scale, y + 45 * scale),
-        (x + 3 * scale, y + 45 * scale),
-        (x + 3 * scale, y + 18 * scale),
-        (x + 8 * scale, y + 18 * scale),
-    ]
-    points = [rotate_point(px, py, x, y, orientation) for px, py in points]
-    draw.polygon(points, fill=fill, outline=fill)
-
-
-def draw_star(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    radius: int,
-    scale: int,
-    color: str,
-) -> None:
-    if scale <= 0 or radius <= 0:
-        return
-    rendered_radius = radius * scale
-    diagonal = round(rendered_radius / math.sqrt(2))
-    lines = [
-        ((x, y - rendered_radius), (x, y + rendered_radius)),
-        ((x - rendered_radius, y), (x + rendered_radius, y)),
-        ((x - diagonal, y - diagonal), (x + diagonal, y + diagonal)),
-        ((x + diagonal, y - diagonal), (x - diagonal, y + diagonal)),
-    ]
-    for point1, point2 in lines:
-        draw_line(draw, point1, point2, color, width=3)
-
-
-def draw_yagi(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    orientation: int,
-    scale: int,
-    color: str,
-) -> None:
-    scale = max(1, scale)
-    axis_start = rotate_point(x + 30 * scale, y, x, y, orientation)
-    axis_end = rotate_point(x, y + 100 * scale, x, y, orientation)
-    width = max(1, 2 * scale)
-    draw_line(draw, axis_start, axis_end, color, width)
-
-    for position in (0.15, 0.35, 0.55, 0.75):
-        axis_x = (1 - position) * (x + 30 * scale) + position * x
-        axis_y = (1 - position) * y + position * (y + 100 * scale)
-        point1 = rotate_point(
-            axis_x - 8 * scale,
-            axis_y - 3 * scale,
-            x,
-            y,
-            orientation,
-        )
-        point2 = rotate_point(
-            axis_x + 8 * scale,
-            axis_y + 3 * scale,
-            x,
-            y,
-            orientation,
-        )
-        draw_line(draw, point1, point2, color, width)
-
-
-def draw_dish(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    orientation: int,
-    scale: int,
-    color: str,
-) -> None:
-    if scale <= 0:
-        return
-
-    facing = orientation % 2
-    scale = max(1, scale)
-    radius = 40 * scale
-    hub_radius = 5 * scale
-    mast_length = 30 * scale
-    width = 3
-    flip = -1 if facing == 0 else 1
-
-    arc_points: List[Tuple[int, int]] = []
-    for angle in range(90, 181, 5):
-        theta = math.radians(angle)
-        dx = round(radius * math.cos(theta)) * flip
-        dy = round(radius * math.sin(theta))
-        arc_points.append((x + dx, y + dy))
-    draw.line(arc_points, fill=color, width=width)
-
-    end1_dx = -radius * flip
-    end1_dy = 0
-    end2_dx = 0
-    end2_dy = radius
-    draw_line(draw, (x, y), (x + end1_dx, y + end1_dy), color, width)
-    draw_line(draw, (x, y), (x + end2_dx, y + end2_dy), color, width)
-
-    midpoint_x = round((-radius / math.sqrt(2)) * flip)
-    midpoint_y = round(radius / math.sqrt(2))
-    draw_line(
-        draw,
-        (x + midpoint_x, y + midpoint_y),
-        (x + midpoint_x, y + midpoint_y + mast_length),
-        color,
-        width,
-    )
-
-    draw.ellipse(
-        (x - hub_radius, y - hub_radius, x + hub_radius, y + hub_radius),
-        fill=color,
-        outline=color,
-    )
-
-
-def draw_radio(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    orientation: int,
-    scale: int,
-    color: str,
-) -> None:
-    # The constructor currently stores orientation but intentionally renders the
-    # radio in its original left-to-right orientation.
-    del orientation
-    if scale <= 0:
-        return
-
-    scale = max(1, scale)
-    body_width = 50 * scale
-    body_height = 20 * scale
-    knob_radius = 5 * scale
-    knob_x = x + 10 * scale
-    knob_y = y + 10 * scale
-    screen_x1 = x + 25 * scale
-    screen_y1 = y + 5 * scale
-    screen_x2 = x + 45 * scale
-    screen_y2 = y + 15 * scale
-    width = 3
-
-    draw.rectangle((x, y, x + body_width, y + body_height), outline=color, width=width)
-    draw.ellipse(
-        (
-            knob_x - knob_radius,
-            knob_y - knob_radius,
-            knob_x + knob_radius,
-            knob_y + knob_radius,
-        ),
-        outline=color,
-        width=width,
-    )
-    draw.rectangle(
-        (screen_x1, screen_y1, screen_x2, screen_y2),
-        outline=color,
-        width=width,
-    )
-
-
-def draw_arc_line(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    radius: int,
-    start_angle: int,
-    arc_degrees: int,
-    color: str,
-) -> None:
-    if radius <= 0:
-        return
-
-    start_angle %= 360
-    arc_degrees = clamp(arc_degrees, 0, 360)
-    if arc_degrees <= 0:
-        return
-
-    arc_points: List[Tuple[int, int]] = []
-    # Match the constructor exactly: five-degree samples beginning at the
-    # requested start angle. A non-multiple-of-five sweep ends at the final
-    # sample before the requested endpoint.
-    for angle_value in range(start_angle, start_angle + arc_degrees + 1, 5):
-        theta = math.radians(angle_value % 360)
-        arc_points.append(
-            (
-                round(x + radius * math.cos(theta)),
-                round(y - radius * math.sin(theta)),
-            )
-        )
-
-    if len(arc_points) >= 2:
-        draw.line(arc_points, fill=color, width=3)
-
-
-def draw_radio_waves(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    radius: int,
-    scale: int,
-    start_angle: int,
-    arc_degrees: int,
-    color: str,
-) -> None:
-    if scale <= 0 or radius <= 0 or arc_degrees <= 0:
-        return
-    base_radius = radius * scale
-    spacing = 2 * radius * scale
-    for offset in (0, spacing, 2 * spacing):
-        draw_arc_line(
-            draw,
-            x,
-            y,
-            base_radius + offset,
-            start_angle,
-            arc_degrees,
-            color,
-        )
-
-
-def draw_moon(
-    draw: ImageDraw.ImageDraw,
-    x: int,
-    y: int,
-    scale: int,
-    moon_color: str,
-    crater_color: str,
-) -> None:
-    if scale <= 0:
-        return
-    scale = max(1, scale)
-    moon_radius = 36 * scale
-    left = x - moon_radius
-    top = y - moon_radius
-    right = x + moon_radius
-    bottom = y + moon_radius
-    draw.ellipse((left, top, right, bottom), fill=moon_color, outline=moon_color)
-
-    diameter = moon_radius * 2
-    crater_points = [
-        (1 / 5, 1 / 4, 3),
-        (3 / 7, 5 / 8, 5),
-        (1 / 4, 7 / 9, 4),
-        (4 / 5, 2 / 7, 2),
-        (7 / 12, 1 / 5, 6),
-        (2 / 3, 2 / 5, 3),
-        (5 / 8, 3 / 4, 4),
-        (7 / 20, 3 / 7, 2),
-        (3 / 20, 5 / 9, 5),
-        (3 / 4, 3 / 5, 3),
-    ]
-    for fraction_x, fraction_y, base_radius in crater_points:
-        center_x = left + round(diameter * fraction_x)
-        center_y = top + round(diameter * fraction_y)
-        crater_radius = base_radius * scale
-        draw.ellipse(
-            (
-                center_x - crater_radius,
-                center_y - crater_radius,
-                center_x + crater_radius,
-                center_y + crater_radius,
-            ),
-            outline=crater_color,
-            width=3,
-        )
-
-
-def draw_double_box(
-    draw: ImageDraw.ImageDraw,
-    x1: int,
-    y1: int,
-    x2: int,
-    y2: int,
-    percent: int,
-    color: str,
-) -> None:
-    left, right = min(x1, x2), max(x1, x2)
-    top, bottom = min(y1, y2), max(y1, y2)
-    divider_y = top + round((bottom - top) * clamp(percent, 0, 100) / 100)
-    draw.rectangle([left, top, right, bottom], outline=color, width=2)
-    draw.line([(left, divider_y), (right, divider_y)], fill=color, width=2)
-
-
-def render_command(command: DrawCommand, target: ImageDraw.ImageDraw) -> None:
-    validate_command(command)
-    fields = command.fields
-    opcode = command.opcode
-    color = COLOR_HEX[command.color]
-
-    if opcode == 0x0:
-        target.text((fields["x"], fields["y"]), fields["text"], fill=color)
-    elif opcode == 0x1:
-        draw_line(
-            target,
-            (fields["x1"], fields["y1"]),
-            (fields["x2"], fields["y2"]),
-            color,
-            2,
-        )
-    elif opcode == 0x2:
-        left, right = min(fields["x1"], fields["x2"]), max(fields["x1"], fields["x2"])
-        top, bottom = min(fields["y1"], fields["y2"]), max(fields["y1"], fields["y2"])
-        target.rectangle(
-            [left, top, right, bottom],
-            outline=color,
-            fill=color if fields["fill"] else None,
-            width=2,
-        )
-    elif opcode == 0x3:
-        radius_x = fields["radius_w"] * fields["scale"]
-        radius_y = fields["radius_h"] * fields["scale"]
-        box = [
-            fields["x"] - radius_x,
-            fields["y"] - radius_y,
-            fields["x"] + radius_x,
-            fields["y"] + radius_y,
-        ]
-        target.ellipse(
-            box,
-            outline=color,
-            fill=color if fields["fill"] else None,
-            width=2,
-        )
-    elif opcode in {0x4, 0x5}:
-        points = polygon_regular(
-            fields["x"],
-            fields["y"],
-            18 * fields["scale"],
-            3,
-            -90 + fields["orientation"] * 90,
-        )
-        if opcode == 0x5:
-            target.polygon(points, outline=color, fill=color)
-        else:
-            target.line(points + [points[0]], fill=color, width=2)
-    elif opcode == 0x6:
-        draw_arrow(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["orientation"],
-            fields["scale"],
-            color,
-        )
-    elif opcode == 0x7:
-        draw_star(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["radius"],
-            fields["scale"],
-            color,
-        )
-    elif opcode == 0x8:
-        draw_arc_line(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["radius"] * fields["scale"],
-            fields["start_angle"],
-            fields["arc_degrees"],
-            color,
-        )
-    elif opcode == 0x9:
-        draw_yagi(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["orientation"],
-            fields["scale"],
-            color,
-        )
-    elif opcode == 0xA:
-        draw_dish(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["orientation"],
-            fields["scale"],
-            color,
-        )
-    elif opcode == 0xB:
-        draw_radio(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["orientation"],
-            fields["scale"],
-            color,
-        )
-    elif opcode == 0xC:
-        draw_radio_waves(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["radius"],
-            fields["scale"],
-            fields["start_angle"],
-            fields["arc_degrees"],
-            color,
-        )
-    elif opcode == 0xD:
-        draw_moon(
-            target,
-            fields["x"],
-            fields["y"],
-            fields["scale"],
-            color,
-            COLOR_HEX[fields["crater_color"]],
-        )
-    elif opcode == 0xE:
-        draw_double_box(
-            target,
-            fields["x1"],
-            fields["y1"],
-            fields["x2"],
-            fields["y2"],
-            fields["percent"],
-            color,
-        )
-    else:  # pragma: no cover - validated earlier
-        raise CodecError(f"Unsupported opcode {opcode}.")
-
-
-def render_image(commands: Sequence[DrawCommand], output_path: Path) -> None:
-    image = Image.new("RGB", (CANVAS_W, CANVAS_H), BACKGROUND)
-    draw = ImageDraw.Draw(image)
-    for index, command in enumerate(commands):
+    for order, path in enumerate(_candidate_core_paths(explicit)):
+        if not path.is_file():
+            continue
         try:
-            render_command(command, draw)
+            module = _import_core(path)
         except Exception as exc:
-            image.close()
-            raise CodecError(f"Render failed on command {index}: {exc}") from exc
-    image.save(output_path)
-    image.close()
+            failures.append(f"{path}: import failed: {exc}")
+            continue
+
+        protocol = getattr(module, "PROTOCOL_VERSION", None)
+        if not isinstance(protocol, int):
+            failures.append(f"{path}: missing integer PROTOCOL_VERSION")
+            continue
+        if protocol not in SUPPORTED_PROTOCOL_VERSIONS:
+            failures.append(
+                f"{path}: protocol {protocol}; supported protocols are "
+                f"{', '.join(map(str, SUPPORTED_PROTOCOL_VERSIONS))}"
+            )
+            continue
+        if required_protocol is not None and protocol != required_protocol:
+            failures.append(
+                f"{path}: protocol {protocol}; input requires protocol {required_protocol}"
+            )
+            continue
+
+        required_functions = ("decode_frames", "render_to_pillow")
+        missing = [name for name in required_functions if not callable(getattr(module, name, None))]
+        if missing:
+            failures.append(f"{path}: missing required function(s): {', '.join(missing)}")
+            continue
+
+        accepted.append((protocol, -order, module, path.resolve()))
+
+    if accepted:
+        accepted.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        _protocol, _preference, module, path = accepted[0]
+        return module, path
+
+    searched = "\n".join(f"  - {path}" for path in _candidate_core_paths(explicit))
+    rejected = "\n".join(f"  - {failure}" for failure in failures)
+    target = f"protocol {required_protocol}" if required_protocol is not None else "protocol 3 or 2"
+    message = (
+        f"A compatible MCoreIMG SVG Constructor core for {target} was not found.\n\n"
+        "Place this reconstructor beside MCoreIMG-Constructor.py, or pass:\n"
+        "  --core /path/to/MCoreIMG-Constructor.py\n\n"
+        f"Searched:\n{searched}"
+    )
+    if rejected:
+        message += f"\n\nRejected candidates:\n{rejected}"
+    raise ReconstructorError(message)
 
 
-# ---------------------------------------------------------------------------
-# Input/output handling
-# ---------------------------------------------------------------------------
-
-
-def select_input_file() -> Optional[str]:
+def choose_input_file() -> Optional[Path]:
     try:
-        root = tk.Tk()
-    except tk.TclError as exc:
-        print(f"Could not open file chooser: {exc}", file=sys.stderr)
-        return None
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError as exc:
+        raise ReconstructorError("No input file was supplied and Tkinter is unavailable.") from exc
 
+    root = tk.Tk()
     root.withdraw()
     try:
         root.attributes("-topmost", True)
     except tk.TclError:
         pass
-
     filename = filedialog.askopenfilename(
-        title="Select MCoreIMG transport file",
+        title="Select MCoreIMG transport or SVG source",
         filetypes=[
-            ("MCoreIMG transport", "*.mci"),
-            ("Text files", "*.txt"),
+            ("MCoreIMG transport", "*.mci *.txt"),
+            ("MCoreIMG SVG source", "*.mci.json *.json"),
+            ("SVG source", "*.svg *.svgz"),
             ("All files", "*.*"),
         ],
     )
     root.destroy()
-    return filename or None
+    return Path(filename) if filename else None
 
 
-def extract_frames_from_text(text: str) -> Tuple[List[str], int]:
-    """Extract complete MCI frames from direct exports or prefixed log lines.
+def _unique_strings(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
-    Direct .mci exports are one frame per line. For captured chat/log files, a
-    frame may follow a timestamp, sender, or other prefix. The 15-character
-    header contains the exact payload length, allowing safe extraction without
-    treating unrelated messages as drawing data.
-    """
-    frames: List[str] = []
-    ignored_nonempty = 0
 
+def extract_frames(text: str) -> list[str]:
+    frames: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
+        if line.startswith("MCI") and not any(ch.isspace() for ch in line):
+            frames.append(line)
+        else:
+            frames.extend(match.group(0) for match in FRAME_TOKEN_RE.finditer(line))
 
-        found_on_line = False
-        search_from = 0
-        while True:
-            start = line.find(FRAME_MAGIC, search_from)
-            if start < 0:
-                break
-            search_from = start + len(FRAME_MAGIC)
+    frames = _unique_strings(frames)
+    if not frames:
+        raise ReconstructorError("No MCoreIMG frames beginning with 'MCI' were found.")
 
-            if len(line) - start < FRAME_HEADER_LEN:
-                continue
-            header = line[start : start + FRAME_HEADER_LEN]
-            try:
-                if header[:3] != FRAME_MAGIC:
-                    continue
-                payload_length = decode_base62(header[9:11])
-            except FrameError:
-                continue
-
-            frame_length = FRAME_HEADER_LEN + payload_length
-            candidate = line[start : start + frame_length]
-            if len(candidate) != frame_length:
-                continue
-
-            frames.append(candidate)
-            found_on_line = True
-            break
-
-        if not found_on_line:
-            ignored_nonempty += 1
-
-    return frames, ignored_nonempty
+    versions = {frame_protocol_version(frame) for frame in frames}
+    if len(versions) != 1:
+        raise ReconstructorError(
+            "Input contains mixed MCoreIMG protocol versions: "
+            + ", ".join(map(str, sorted(versions)))
+        )
+    version = next(iter(versions))
+    if version not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise ReconstructorError(
+            f"Input uses protocol {version}; this reconstructor supports protocols "
+            f"{', '.join(map(str, SUPPORTED_PROTOCOL_VERSIONS))}."
+        )
+    return frames
 
 
-def default_output_path(input_path: Path, image_id: str) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    return input_path.with_name(f"{timestamp}-MCoreIMG-{image_id}.png")
+def read_transport_frames(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="ascii")
+    except UnicodeDecodeError:
+        text = path.read_text(encoding="utf-8")
+    return extract_frames(text)
 
 
-def write_source_json(
-    output_path: Path,
-    commands: Sequence[DrawCommand],
-    image_id: str,
-) -> Path:
-    json_path = output_path.with_suffix(".mci.json")
-    document = {
-        "format": SOURCE_FORMAT,
-        "version": SOURCE_VERSION,
-        "protocol_version": PROTOCOL_VERSION,
-        "canvas": {"width": CANVAS_W, "height": CANVAS_H},
-        "metadata": {
-            "grid": DEFAULT_GRID,
-            "grid_note": "Grid is source metadata and is not transmitted in MCoreIMG frames.",
-            "reconstructed_image_id": image_id,
+def is_editable_json(path: Path) -> bool:
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    return suffixes[-2:] == [".mci", ".json"] or path.suffix.lower() == ".json"
+
+
+def inspect_source_protocol(path: Path) -> Optional[int]:
+    if not is_editable_json(path):
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ReconstructorError(f"Could not inspect source JSON: {exc}") from exc
+    protocol = obj.get("protocol_version")
+    if protocol is None:
+        return None
+    try:
+        protocol = int(protocol)
+    except (TypeError, ValueError) as exc:
+        raise ReconstructorError(f"Invalid source protocol_version: {protocol!r}") from exc
+    if protocol not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise ReconstructorError(f"Unsupported source protocol version: {protocol}")
+    return protocol
+
+
+def prepare_input(path: Path) -> tuple[Optional[list[str]], Optional[int], str]:
+    if is_editable_json(path):
+        return None, inspect_source_protocol(path), "editable source"
+    if path.suffix.lower() in {".svg", ".svgz"}:
+        return None, None, "SVG source"
+    frames = read_transport_frames(path)
+    return frames, frame_protocol_version(frames[0]), "transport"
+
+
+def load_commands(
+    core: ModuleType,
+    input_path: Path,
+    prepared_frames: Optional[Sequence[str]] = None,
+) -> tuple[list[Any], str]:
+    if is_editable_json(input_path) or input_path.suffix.lower() in {".svg", ".svgz"}:
+        load_source = getattr(core, "load_source", None)
+        if not callable(load_source):
+            raise ReconstructorError("The selected Constructor cannot load SVG/source files.")
+        try:
+            document = load_source(input_path)
+        except Exception as exc:
+            raise ReconstructorError(f"Source loading failed: {exc}") from exc
+        transformed = getattr(document, "transformed_commands", None)
+        commands = transformed() if callable(transformed) else list(getattr(document, "commands", []))
+        return list(commands), "editable/SVG source"
+
+    frames = list(prepared_frames) if prepared_frames is not None else read_transport_frames(input_path)
+    max_messages = int(getattr(core, "MAX_MESSAGES", 10))
+    if len(frames) > max_messages:
+        raise ReconstructorError(
+            f"Found {len(frames)} frames, but protocol {getattr(core, 'PROTOCOL_VERSION', '?')} "
+            f"allows at most {max_messages}."
+        )
+    try:
+        commands = core.decode_frames(frames)
+    except Exception as exc:
+        raise ReconstructorError(f"Transport decoding failed: {exc}") from exc
+    return list(commands), f"{len(frames)} transport frame(s)"
+
+
+def command_to_json(command: Any) -> dict[str, Any]:
+    method = getattr(command, "to_json", None)
+    if callable(method):
+        value = method()
+        if isinstance(value, dict):
+            return value
+    style = getattr(command, "style", None)
+    return {
+        "opcode": getattr(command, "opcode", None),
+        "style": {
+            "fill": getattr(style, "fill", None),
+            "stroke": getattr(style, "stroke", None),
+            "stroke_width": getattr(style, "stroke_width", 1),
+            "fill_rule": getattr(style, "fill_rule", "nonzero"),
         },
-        "commands": [command.to_json() for command in commands],
+        "geom": getattr(command, "geom", {}),
+        "label": getattr(command, "label", ""),
+        "visible": getattr(command, "visible", True),
     }
-    json_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    return json_path
 
 
-def command_summary(command: DrawCommand) -> str:
-    fields = command.fields
-    color_name = COLOR_TABLE[command.color][1]
-    if command.opcode == 0x0:
-        detail = f"({fields['x']},{fields['y']}) {fields.get('text', '')!r}"
-    elif command.opcode in {0x1, 0x2, 0xE}:
-        detail = f"({fields['x1']},{fields['y1']}) -> ({fields['x2']},{fields['y2']})"
-    else:
-        detail = f"({fields['x']},{fields['y']})"
-    return f"{command.shape.code} {command.shape.name} | {color_name} | {detail}"
+def default_output_path(input_path: Path) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = input_path.name
+    stem = name[:-9] if name.lower().endswith(".mci.json") else input_path.stem
+    return input_path.with_name(f"{stem}-reconstructed-{timestamp}.png")
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def dump_source_json(
+    core: ModuleType,
+    commands: Sequence[Any],
+    input_path: Path,
+    output_path: Path,
+) -> Path:
+    payload = {
+        "format": getattr(core, "SOURCE_FORMAT", "MCoreIMG-SVG-source"),
+        "version": int(getattr(core, "SOURCE_VERSION", 1)),
+        "protocol_version": int(getattr(core, "PROTOCOL_VERSION", PREFERRED_PROTOCOL_VERSION)),
+        "canvas": {
+            "width": int(getattr(core, "CANVAS_W", 720)),
+            "height": int(getattr(core, "CANVAS_H", 480)),
+        },
+        "source_name": input_path.stem,
+        "transform": {"scale": 1.0, "offset_x": 0.0, "offset_y": 0.0},
+        "commands": [command_to_json(command) for command in commands],
+        "warnings": [
+            "Reconstructed from MCoreIMG transport; original SVG authoring metadata "
+            "and non-transmitted labels are unavailable."
+        ],
+    }
+    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return output_path
+
+
+def open_output(path: Path) -> None:
+    try:
+        if sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def alpha_nibble(color: Optional[str]) -> Optional[int]:
+    if not color:
+        return None
+    text = str(color).strip().lstrip("#")
+    if len(text) == 8:
+        try:
+            return round(int(text[6:8], 16) * 15 / 255)
+        except ValueError:
+            return None
+    return 15
+
+
+def alpha_color_count(commands: Sequence[Any]) -> int:
+    colors: set[str] = set()
+    for command in commands:
+        style = getattr(command, "style", None)
+        for color in (getattr(style, "fill", None), getattr(style, "stroke", None)):
+            nibble = alpha_nibble(color)
+            if color and nibble is not None and nibble < 15:
+                colors.add(str(color).upper())
+    return len(colors)
+
+
+def list_commands(core: ModuleType, commands: Sequence[Any]) -> None:
+    names = getattr(core, "OP_NAMES", {})
+    for index, command in enumerate(commands):
+        opcode = getattr(command, "opcode", None)
+        name = names.get(opcode, f"Opcode {opcode}")
+        style = getattr(command, "style", None)
+        fill = getattr(style, "fill", None)
+        stroke = getattr(style, "stroke", None)
+        width = getattr(style, "stroke_width", None)
+        print(
+            f"{index:04d}  {name:<10} "
+            f"fill={fill!s:<10} A4={alpha_nibble(fill)!s:<2} "
+            f"stroke={stroke!s:<10} A4={alpha_nibble(stroke)!s:<2} "
+            f"width={width!s:<4} geom={getattr(command, 'geom', {})}"
+        )
+
+
+def run_self_test(core: ModuleType) -> None:
+    core_test = getattr(core, "run_self_test", None)
+    if callable(core_test):
+        core_test()
+
+    sample_document = getattr(core, "sample_document", None)
+    quantize_command = getattr(core, "quantize_command", None)
+    encode_image = getattr(core, "encode_image", None)
+    if not all(callable(v) for v in (sample_document, quantize_command, encode_image)):
+        raise ReconstructorError("The selected Constructor lacks round-trip self-test helpers.")
+
+    document = sample_document()
+    source = [quantize_command(command) for command in getattr(document, "commands", [])]
+    encoded = encode_image(source)
+    decoded = core.decode_frames(encoded.frames)
+    image = core.render_to_pillow(decoded)
+    expected_size = (int(getattr(core, "CANVAS_W", 720)), int(getattr(core, "CANVAS_H", 480)))
+    try:
+        if image.size != expected_size:
+            raise ReconstructorError(f"Unexpected rendered image size: {image.size}")
+        protocol = int(getattr(core, "PROTOCOL_VERSION", 0))
+        if protocol >= 3 and image.mode != "RGBA":
+            raise ReconstructorError(f"Protocol 3 renderer returned {image.mode}; expected RGBA.")
+    finally:
+        image.close()
+    if len(decoded) != len(source):
+        raise ReconstructorError(f"Round trip changed command count: {len(source)} -> {len(decoded)}")
+    print("MCoreIMG SVG Reconstructor self-test: PASS")
+    print(
+        f"Protocol {getattr(core, 'PROTOCOL_VERSION', '?')} | {len(decoded)} commands | "
+        f"{len(encoded.frames)} frame(s) | Constructor build "
+        f"{getattr(core, 'CONSTRUCTOR_BUILD', 'unknown')}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Decode and render MCoreIMG compressed MeshCore frames."
+        description="Reconstruct protocol-v2/v3 MCoreIMG SVG/vector frames."
     )
+    parser.add_argument("input", nargs="?", help="Input .mci, text, .mci.json, .svg, or .svgz file")
+    parser.add_argument("-o", "--output", help="Output PNG path")
+    parser.add_argument("--core", help="Path to the matching MCoreIMG Constructor Python file")
     parser.add_argument(
-        "input",
-        nargs="?",
-        help="MCoreIMG .mci transport file. Opens a file chooser when omitted.",
+        "--protocol", type=int, choices=SUPPORTED_PROTOCOL_VERSIONS,
+        help="Force protocol 2 or 3 for self-test or ambiguous source files",
     )
-    parser.add_argument(
-        "-o",
-        "--output",
-        help="PNG output path. Defaults beside the input file with timestamp and image ID.",
-    )
-    parser.add_argument(
-        "--dump-json",
-        action="store_true",
-        help="Also write decoded commands as constructor-compatible .mci.json source.",
-    )
-    parser.add_argument(
-        "--list-commands",
-        action="store_true",
-        help="Print the decoded drawing-command list.",
-    )
+    parser.add_argument("--dump-json", action="store_true", help="Write Constructor-compatible source JSON")
+    parser.add_argument("--list-commands", action="store_true", help="Print decoded commands and A4 alpha")
+    parser.add_argument("--no-open", action="store_true", help="Do not open the reconstructed PNG")
+    parser.add_argument("--self-test", action="store_true", help="Run codec/rendering round-trip tests")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
-
-    input_name = args.input or select_input_file()
-    if not input_name:
-        print("No input file selected.")
-        return 1
-
-    input_path = Path(input_name).expanduser().resolve()
-    if not input_path.is_file():
-        print(f"Input file does not exist: {input_path}", file=sys.stderr)
-        return 2
-
+    args = build_parser().parse_args(argv)
     try:
-        text = input_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        print(f"Input is not valid UTF-8/ASCII text: {exc}", file=sys.stderr)
-        return 2
-    except OSError as exc:
-        print(f"Could not read input file: {exc}", file=sys.stderr)
-        return 2
+        if args.self_test:
+            core, core_path = load_constructor_core(args.core, args.protocol)
+            print(f"Codec core: {core_path}")
+            run_self_test(core)
+            return 0
 
-    frames, ignored_lines = extract_frames_from_text(text)
-    if not frames:
-        print("No MCoreIMG frames were found in the selected file.", file=sys.stderr)
-        return 3
+        input_path = Path(args.input).expanduser() if args.input else choose_input_file()
+        if input_path is None:
+            print("No file selected.")
+            return 1
+        input_path = input_path.resolve()
+        if not input_path.is_file():
+            raise ReconstructorError(f"Input file does not exist: {input_path}")
 
-    try:
-        image_id, commands, duplicate_count = decode_image_frames(frames)
-    except (FrameError, CodecError) as exc:
-        print(f"Reconstruction failed: {exc}", file=sys.stderr)
-        return 4
+        frames, detected_protocol, _kind = prepare_input(input_path)
+        if args.protocol is not None and detected_protocol is not None and args.protocol != detected_protocol:
+            raise ReconstructorError(
+                f"Input uses protocol {detected_protocol}, but --protocol requested {args.protocol}."
+            )
+        required_protocol = args.protocol or detected_protocol
+        core, core_path = load_constructor_core(args.core, required_protocol)
+        core_protocol = int(getattr(core, "PROTOCOL_VERSION", -1))
 
-    output_path = (
-        Path(args.output).expanduser().resolve()
-        if args.output
-        else default_output_path(input_path, image_id)
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        commands, source_description = load_commands(core, input_path, frames)
+        if not commands:
+            raise ReconstructorError("The input decoded successfully but contains no commands.")
+        if args.list_commands:
+            list_commands(core, commands)
 
-    try:
-        render_image(commands, output_path)
-    except (CodecError, OSError) as exc:
-        print(f"Could not render PNG: {exc}", file=sys.stderr)
-        return 5
-
-    print(f"MCoreIMG image ID: {image_id}")
-    print(f"Validated frames: {len(frames) - duplicate_count}")
-    if duplicate_count:
-        print(f"Identical duplicate retransmissions ignored: {duplicate_count}")
-    if ignored_lines:
-        print(f"Non-MCoreIMG lines ignored: {ignored_lines}")
-    print(f"Decoded commands: {len(commands)}")
-    print(f"Image reconstruction complete: {output_path}")
-
-    if args.list_commands:
-        for index, command in enumerate(commands):
-            print(f"{index:03d}: {command_summary(command)}")
-
-    if args.dump_json:
+        output_path = Path(args.output).expanduser().resolve() if args.output else default_output_path(input_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            json_path = write_source_json(output_path, commands, image_id)
-        except OSError as exc:
-            print(f"PNG was created, but JSON export failed: {exc}", file=sys.stderr)
-            return 6
-        print(f"Decoded source JSON: {json_path}")
+            image = core.render_to_pillow(commands)
+            image.save(output_path)
+            image_mode = image.mode
+            image.close()
+        except Exception as exc:
+            raise ReconstructorError(f"PNG rendering failed: {exc}") from exc
 
-    return 0
+        print(f"MCoreIMG SVG Reconstructor {RECONSTRUCTOR_BUILD}")
+        print(f"Codec core: {core_path}")
+        print(f"Constructor build: {getattr(core, 'CONSTRUCTOR_BUILD', 'unknown')}")
+        print(f"Protocol: {core_protocol}")
+        print(f"Loaded: {source_description}")
+        print(f"Decoded commands: {len(commands)}")
+        if core_protocol >= 3:
+            print(f"Palette/rendering: RGB565+A4 source-over alpha ({alpha_color_count(commands)} alpha color(s))")
+        else:
+            print("Palette/rendering: RGB565 opaque")
+        print(f"PNG mode: {image_mode}")
+        print(f"Image reconstruction complete: {output_path}")
+
+        if args.dump_json:
+            json_path = output_path.with_suffix(".mci.json")
+            dump_source_json(core, commands, input_path, json_path)
+            print(f"Decoded source JSON: {json_path}")
+        if not args.no_open:
+            open_output(output_path)
+        return 0
+
+    except ReconstructorError as exc:
+        print(f"Reconstruction failed:\n{exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Reconstruction cancelled.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

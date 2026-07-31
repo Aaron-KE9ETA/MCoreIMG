@@ -1,58 +1,80 @@
-# MCoreIMG
+# MCoreIMG SVG Integration
 
-**MCoreIMG is a compact vector-image instruction protocol for sending small, manually created pictures over MeshCore.**
+**MCoreIMG SVG Integration is an experimental vector-image codec for importing practical SVG artwork, compressing it into MeshCore-sized text frames, and reconstructing it as a PNG.**
 
-Instead of transmitting raster image data, MCoreIMG sends a compressed sequence of drawing commands. A compatible reconstructor validates the received frames, rebuilds the command stream, and renders the original image on a fixed 720 × 480 canvas.
+Instead of transmitting a raster image, MCoreIMG transmits a compact drawing program: a palette, vector commands, geometry, style changes, and repeat references. The receiving side validates the transport, decodes the command stream, and renders the image locally.
 
-The protocol is designed around a strict transport target:
+This branch extends the original MCoreIMG concept with:
 
-- No more than **five MeshCore text messages**
-- No more than **150 ASCII characters per message**
-- A **15-character control header** on each message
-- Up to **135 Base91 payload characters** per message
-- ACK and retransmission rather than forward-error correction or blind repetition
+- SVG and SVGZ import
+- Scalable vector geometry
+- Paths, curves, fills, strokes, transforms, and draw order
+- True alpha-channel transport in protocol 3
+- A ten-message MeshCore envelope
+- Shared constructor/reconstructor codec behavior
+- Aggressive stateful compression designed around very small messages
 
-MCoreIMG is the successor to EMEIMG. It abandons EMEIMG's independent fixed-length drawing packets in favor of one stateful compressed bitstream.
+> [!WARNING]
+> This project is pre-alpha. The source format, transport format, and protocol version may change without backward compatibility. Keep matching constructor and reconstructor builds together.
 
-> [!IMPORTANT]
-> MCoreIMG is currently pre-alpha. The transport and bitstream formats may change. A constructor and reconstructor must use compatible protocol versions.
+## Branch Status
 
-## Why MCoreIMG Exists
+The current SVG alpha branch uses:
 
-Mesh networks are good at moving compact text messages, not conventional image files. Even a tiny PNG normally exceeds the available message budget by a large margin.
+| Component | Current behavior |
+|---|---|
+| Canvas | 720 × 480 pixels |
+| Preferred protocol | Protocol 3 |
+| Protocol 3 color | RGB565 + 4-bit alpha |
+| Transport limit | Up to 10 messages |
+| Message limit | 150 ASCII characters each |
+| Frame header | 15 characters |
+| Payload per frame | Up to 135 Base91 characters |
+| Palette | Up to 32 entries per image |
+| Command limit | 2048 vector commands |
+| Integrity checks | Per-frame CRC-16 and whole-stream CRC-32 |
 
-MCoreIMG approaches the problem differently:
+Protocol 2 remains useful for older opaque SVG/vector transports. The protocol-aware reconstructor supports both protocol 2 and protocol 3, but protocol 3 is preferred for the current branch.
 
-1. The sender draws an image from supported vector primitives.
-2. The constructor stores those primitives in ordinary draw order.
-3. The codec compresses the command stream using state, prediction, variable-length integers, and translated-repeat references.
-4. The result is encoded into text-safe Base91.
-5. The payload is split into one to five MeshCore messages.
-6. The receiver validates and reconstructs the image locally.
+## What This Branch Is
 
-The result is closer to sending a miniature drawing program than sending a picture file.
+MCoreIMG SVG Integration is a constrained SVG-to-vector transport system. It is designed to preserve the useful visual structure of simple SVG artwork while fitting within severe MeshCore message limits.
 
-## Project Goals
+It is **not**:
 
-- Fit useful simple artwork into five 150-character MeshCore messages.
-- Preserve normal artistic draw order.
-- Keep the source image editable in a human-readable format.
-- Detect corruption before rendering.
-- Permit targeted retransmission of a damaged or missing frame.
-- Avoid requiring a human artist to manually optimize the compressed stream.
-- Keep constructor and reconstructor behavior deterministic and compatible.
+- A complete web-browser SVG implementation
+- A conventional SVG compressor
+- A lossless replacement for the original SVG document
+- TinyVG-compatible
+- Intended for photographs or arbitrary raster images
+
+The editable `.mci.json` source retains MCoreIMG vector commands and document transforms. The transmitted `.mci` file contains only the information required to reconstruct the image.
 
 ## Current Components
 
+Canonical filenames after merge should be:
+
 | File | Purpose |
 |---|---|
-| `MCoreIMG-Constructor.py` | Graphical vector editor, source loader, codec, frame generator, preview renderer, and PNG exporter |
-| `MCoreIMG-Reconstructor.py` | Frame extractor, validator, bitstream decoder, command reconstructor, and PNG renderer |
-| `*.mci.json` | Lossless, human-readable editable source |
-| `*.mci` | MeshCore-ready transport frames, one frame per line |
-| Legacy `*.emeimg` files | Older EMEIMG command files that the constructor may import for conversion |
+| `MCoreIMG-SVG-Constructor.py` or `MCoreIMG-Constructor.py` | SVG importer, vector editor, codec, preview renderer, PNG exporter, and MeshCore frame generator |
+| `MCoreIMG-Reconstructor.py` | Protocol detector, frame validator, decoder, source exporter, and PNG reconstructor |
+| `*.mci.json` | Editable MCoreIMG SVG/vector source |
+| `*.mci` | MeshCore-ready transport frames |
+| `*.svg` / `*.svgz` | Imported source artwork |
+| `*.png` | Raster preview or reconstructed output |
+
+The development branch may use versioned filenames such as:
+
+```text
+MCoreIMG-SVG-Constructor-v3.3-ALPHA-ROUNDTRIP.py
+MCoreIMG-Reconstructor-v3.3-ALPHA-FIXED.py
+```
+
+The reconstructor searches for compatible constructor files in its own directory and the current working directory. A specific core can also be supplied with `--core`.
 
 ## Requirements
+
+Python 3.10 or newer is recommended.
 
 ### Arch Linux
 
@@ -60,11 +82,7 @@ The result is closer to sending a miniature drawing program than sending a pictu
 sudo pacman -Syu python tk python-pillow
 ```
 
-The constructor can run without Pillow for basic editing, but Pillow is required for PNG export. The reconstructor requires Pillow.
-
 ### Other Python Environments
-
-Python 3.10 or newer is recommended.
 
 ```bash
 python -m pip install pillow
@@ -72,498 +90,449 @@ python -m pip install pillow
 
 Tkinter may need to be installed through the operating system's package manager.
 
+Pillow is required for:
+
+- PNG export
+- RGBA alpha compositing
+- Authoritative GUI preview parity
+- Reconstructor output
+- The full self-test suite
+
 ## Quick Start
 
-### Create an Image
+### Start the Constructor
+
+Using canonical filenames:
 
 ```bash
-python MCoreIMG-Constructor.py
+python MCoreIMG-SVG-Constructor.py
 ```
 
-Use the editor to select shapes, colors, coordinates, dimensions, orientation, and other shape-specific fields. Commands are stored as layers and rendered in list order.
-
-Save the editable source as:
-
-```text
-example.mci.json
-```
-
-Export the MeshCore transport as:
-
-```text
-example.mci
-```
-
-The exported file contains one complete MCoreIMG frame per line.
-
-### Run the Constructor Self-Test
+Using the current versioned alpha filename:
 
 ```bash
-python MCoreIMG-Constructor.py --self-test
+python MCoreIMG-SVG-Constructor-v3.3-ALPHA-ROUNDTRIP.py
 ```
 
-The self-test checks codec round trips, corruption detection, source JSON round trips, and other regression-sensitive behavior.
+### Import and Export Artwork
+
+1. Select **Open SVG / Source**.
+2. Open an `.svg`, `.svgz`, or `.mci.json` file.
+3. Adjust scale and offset as needed.
+4. Use **Fit** to place the complete image inside the canvas.
+5. Use **Center** to center the current transformed bounds.
+6. Use **Bake Transform** to permanently apply document scale and offset.
+7. Save editable work as `.mci.json`.
+8. Export MeshCore transport as `.mci`.
+9. Export a local preview as `.png`.
+
+Imported SVG artwork is fitted inside the 720 × 480 canvas by default with a small margin. Document scale and offset remain non-destructive until **Bake Transform** is used.
+
+The status display reports:
+
+- Command count
+- Palette size
+- Encoded payload characters
+- Required frame count
+- Whether the image fits the ten-message profile
+- Whether transformed artwork extends outside the canvas
 
 ### Reconstruct an Image
 
-```bash
-python MCoreIMG-Reconstructor.py example.mci
-```
-
-Specify the output filename:
+Using canonical filenames:
 
 ```bash
-python MCoreIMG-Reconstructor.py example.mci --output reconstructed.png
+python MCoreIMG-Reconstructor.py image.mci
 ```
 
-Print the decoded command list:
+Specify an output path:
 
 ```bash
-python MCoreIMG-Reconstructor.py example.mci --list-commands
+python MCoreIMG-Reconstructor.py image.mci --output reconstructed.png
 ```
 
-Also produce constructor-compatible source JSON:
+Use a specific constructor core:
 
 ```bash
-python MCoreIMG-Reconstructor.py example.mci --dump-json
+python MCoreIMG-Reconstructor.py image.mci \
+  --core ./MCoreIMG-SVG-Constructor.py
 ```
 
-When no input file is supplied, the reconstructor opens a graphical file chooser.
+Using the current versioned alpha files:
 
-## Canvas and Rendering
-
-- Canvas width: **720 pixels**
-- Canvas height: **480 pixels**
-- Background: **white**
-- Coordinates begin at the upper-left corner.
-- Valid X coordinates are `0..719`.
-- Valid Y coordinates are `0..479`.
-- Commands are rendered sequentially in source order.
-- Later commands may cover earlier commands.
-- Text is rendered with a hard-coded default size of `20` pixels.
-
-Draw order is not separately transmitted. It is already represented by the order of commands in the decoded stream.
-
-## Supported Opcodes
-
-Opcode `0xF` is reserved by the compressed bitstream and is not a drawable shape.
-
-| Opcode | Code | Shape | Important fields |
-|---:|:---:|---|---|
-| `0x0` | `0` | Text | `x`, `y`, `text` |
-| `0x1` | `1` | Line | `x1`, `y1`, `x2`, `y2` |
-| `0x2` | `2` | Rectangle | two corners, `fill` |
-| `0x3` | `3` | Ellipse | center, horizontal radius, vertical radius, scale, fill |
-| `0x4` | `4` | Triangle Outline | anchor, orientation, scale |
-| `0x5` | `5` | Triangle Fill | anchor, orientation, scale |
-| `0x6` | `6` | Arrow | anchor, orientation, scale |
-| `0x7` | `7` | Star | center, radius, scale |
-| `0x8` | `8` | Semicircle / Arc | center, radius, scale, start angle, arc degrees |
-| `0x9` | `9` | Yagi Antenna | anchor, orientation, scale |
-| `0xA` | `A` | Dish Antenna | anchor, orientation, scale |
-| `0xB` | `B` | Radio Transceiver | anchor, orientation, scale |
-| `0xC` | `C` | Radio Waves | center, radius, scale, start angle, arc degrees |
-| `0xD` | `D` | Moon | anchor, scale, crater color |
-| `0xE` | `E` | DoubleBox | two corners, divider percentage |
-
-The macro-style shapes are reconstructed from known geometry. Only their anchor and adjustable parameters need to be transmitted.
-
-## Human-Readable Source Format
-
-A `.mci.json` file is the editable master copy of an image. It is not the over-the-air representation.
-
-Example:
-
-```json
-{
-  "format": "MCoreIMG-source",
-  "version": 1,
-  "protocol_version": 1,
-  "canvas": {
-    "width": 720,
-    "height": 480
-  },
-  "metadata": {
-    "grid": "EN60"
-  },
-  "commands": [
-    {
-      "opcode": 2,
-      "shape": "2",
-      "color": 5,
-      "fields": {
-        "x1": 40,
-        "y1": 40,
-        "x2": 300,
-        "y2": 180,
-        "fill": 0
-      }
-    },
-    {
-      "opcode": 0,
-      "shape": "0",
-      "color": 0,
-      "fields": {
-        "x": 70,
-        "y": 80,
-        "text": "MCOREIMG"
-      }
-    }
-  ]
-}
+```bash
+python MCoreIMG-Reconstructor-v3.3-ALPHA-FIXED.py image.mci \
+  --core ./MCoreIMG-SVG-Constructor-v3.3-ALPHA-ROUNDTRIP.py
 ```
 
-### Source Metadata
+The reconstructor can also read:
 
-The Maidenhead grid locator is retained as source metadata for identification and project continuity. It is not currently included in the compressed MCoreIMG transport frames.
+- Plain text containing MCoreIMG frames
+- Copied transcripts containing labeled frames
+- `.mci.json` editable source
+- `.svg` and `.svgz` source when a compatible constructor core is available
 
-The source format should remain lossless even when the transport codec changes. A future constructor can therefore re-encode an older source file using a newer protocol version.
+When no input file is supplied, a graphical file chooser opens.
 
-## Transport Profile
-
-Each MeshCore frame is at most 150 characters:
+## Reconstructor Options
 
 ```text
-[15-character header][0 to 135 Base91 payload characters]
+-o, --output PATH       Select the output PNG path
+--core PATH             Select the matching constructor/codec Python file
+--protocol {2,3}        Force protocol 2 or 3
+--dump-json             Write reconstructed MCoreIMG source JSON
+--list-commands         Print decoded commands and alpha values
+--no-open               Do not automatically open the output PNG
+--self-test             Run constructor/transport/reconstructor tests
 ```
 
-An image may use one through five frames.
+Examples:
 
-### Header Layout
-
-The fixed header is:
-
-```text
-MCI V III P T LL CCC F
+```bash
+python MCoreIMG-Reconstructor.py image.mci --list-commands
 ```
 
-The spaces above are explanatory only and are not transmitted.
-
-| Position | Width | Encoding | Meaning |
-|---:|---:|---|---|
-| `0..2` | 3 | ASCII | Magic string `MCI` |
-| `3` | 1 | Base62 | Protocol version |
-| `4..6` | 3 | Base62 | Deterministic image ID |
-| `7` | 1 | Base62 | Zero-based part index |
-| `8` | 1 | Base62 | Total number of parts |
-| `9..10` | 2 | Base62 | Payload character count |
-| `11..13` | 3 | Base62 | CRC-16 of this frame's payload |
-| `14` | 1 | Base62 | Flags |
-
-The current encoder writes flags as zero. The field is reserved for compatible future use.
-
-### Image ID
-
-The three-character image ID is derived deterministically from the encoded image stream. It allows receivers to group frames belonging to the same image and reject accidental mixtures.
-
-It is an identifier, not a cryptographic signature.
-
-### Payload Alphabet
-
-The compressed bytes are converted to a custom Base91 alphabet made from printable ASCII characters.
-
-The following characters are excluded:
-
-```text
-"  '  \
+```bash
+python MCoreIMG-Reconstructor.py image.mci --dump-json --no-open
 ```
 
-Excluding them avoids common quoting and escaping problems in JSON, shells, logs, and chat transports.
+```bash
+python MCoreIMG-Reconstructor.py --protocol 3 --self-test
+```
+
+## Supported Vector Commands
+
+The current transport represents six general vector command types:
+
+| Opcode | Command |
+|---:|---|
+| `0` | Rectangle |
+| `1` | Ellipse |
+| `2` | Line |
+| `3` | Polyline |
+| `4` | Polygon |
+| `5` | Path |
+
+SVG circles are represented as ellipses. Rounded rectangles may be converted into paths.
+
+Paths support:
+
+- MoveTo
+- LineTo
+- Quadratic Bezier
+- Cubic Bezier
+- ClosePath
+
+The importer normalizes common SVG path shortcuts, including horizontal, vertical, smooth cubic, and smooth quadratic commands. SVG arc commands are approximated with line nodes before transport.
+
+## Supported SVG Features
+
+The importer currently handles a practical subset of SVG, including:
+
+- `<rect>`
+- `<circle>`
+- `<ellipse>`
+- `<line>`
+- `<polyline>`
+- `<polygon>`
+- `<path>`
+- Nested groups and containers
+- Affine transforms
+- `viewBox`
+- Common physical and pixel length units
+- Fill and stroke colors
+- Stroke width
+- `nonzero` and `evenodd` fill rules
+- Inherited presentation attributes
+- Inline style declarations
+- Element opacity
+- Fill opacity
+- Stroke opacity
+- `currentColor`
+- Open-subpath SVG fill behavior
+
+Supported transforms include:
+
+- `matrix`
+- `translate`
+- `scale`
+- `rotate`
+- `skewX`
+- `skewY`
+
+## Alpha-Channel Support
+
+Protocol 3 adds true transported transparency.
+
+Each palette entry stores:
+
+- RGB color quantized to RGB565
+- Alpha quantized to 4 bits, from 0 through 15
+
+This is referred to as **RGB565+A4**.
+
+SVG `opacity`, `fill-opacity`, and `stroke-opacity` values are combined during import. Alpha then survives:
+
+1. SVG import
+2. MCoreIMG source storage
+3. Palette quantization
+4. Bitstream encoding
+5. Base91 frame transport
+6. Frame decoding
+7. Command reconstruction
+8. Source-over compositing
+9. RGBA PNG output
+
+Because alpha is quantized to 16 levels, reconstructed transparency may differ slightly from the original SVG.
+
+Protocol 2 transports opaque RGB565 colors only.
+
+## Rendering Semantics
+
+Commands are rendered sequentially in source order. Later commands may cover or blend over earlier commands.
+
+The constructor preview and PNG exporter use the same Pillow-based rendering path whenever Pillow is available. This prevents the GUI preview, exported PNG, and reconstructed PNG from using separate interpretations of paths or alpha.
+
+Open SVG subpaths are implicitly closed for filling but are not automatically closed for stroking unless the source path contains a real ClosePath command.
+
+Protocol 3 uses source-over alpha compositing and produces RGBA PNG output.
 
 ## Compression Model
 
-MCoreIMG compresses the drawing command stream before Base91 encoding.
+MCoreIMG does not compress the original SVG text. It converts the artwork into a compact command stream and compresses that stream structurally.
 
-### 1. Implicit Draw Order
+Current compression techniques include:
 
-Commands remain in artistic draw order. No extra draw-order field is transmitted.
+- Per-image palette indexing
+- RGB565+A4 palette entries
+- Opcode-local style state
+- Opcode-local point and geometry state
+- Predictive coordinate coding
+- Delta encoding
+- Unsigned and signed Exp-Golomb values
+- Rice-style coding where useful
+- Reuse of prior style values
+- Nonadjacent translated-repeat references
+- Shared path segment representation
+- Base91 text encoding
 
-This avoids the cost of sending an index for every shape and avoids forcing the artist to draw all objects of one opcode together.
+### Opcode-Local State
 
-### 2. Compact Opcodes
+Each command type retains its own recent state. A rectangle can therefore reuse prior rectangle values even when lines, paths, or ellipses occur between the two rectangle commands.
 
-Drawable shapes use four-bit opcodes.
+This preserves ordinary artistic draw order without requiring the artist to group all commands of the same type together.
 
-The codec can use a one-bit same-opcode indication when the relevant opcode context is already known instead of writing the full four-bit opcode again.
+### Nonadjacent Translated Repeats
 
-### 3. Opcode-Local State
+A command can reference a compatible earlier command and transmit only a translation offset when the same geometry appears elsewhere.
 
-Shape parameters are maintained in opcode-local state rather than one indiscriminate global parameter history.
+This is useful for repeated:
 
-For example, the most recently used star radius belongs to the star opcode's state. Drawing a radio or rectangle between two stars does not erase the useful star defaults.
+- Eyes
+- Buttons
+- Windows
+- Stars
+- Symbols
+- Decorative shapes
+- Repeated path components
 
-This is important because natural artwork frequently alternates between object types. Opcode-local state improves compression without changing draw order.
+The repeated command does not need to be adjacent to the original.
 
-Typical stateful fields include:
+## Transport Profile
 
-- Color
-- Radius
-- Horizontal and vertical radii
-- Scale
-- Orientation
-- Fill
-- Arc start and sweep
-- Moon crater color
-- DoubleBox divider percentage
-
-A one-bit reuse/change flag indicates whether a value is unchanged. Changed values are then written using the appropriate fixed or variable-length representation.
-
-### 4. Predictive Coordinates
-
-The first usable coordinate context is encoded absolutely:
-
-- X uses 10 bits.
-- Y uses 9 bits.
-
-Later coordinates may be encoded as signed deltas from a previous relevant point when that representation is shorter. The encoder chooses between delta and absolute forms.
-
-For two-point commands, the second point may be represented relative to the first point.
-
-### 5. ZigZag and Golomb-Rice Coding
-
-Signed coordinate and translation deltas are mapped to non-negative integers using ZigZag ordering:
+Each exported frame is no longer than 150 characters:
 
 ```text
-0, -1, +1, -2, +2, ...
+[15-character MCoreIMG header][0 to 135 Base91 payload characters]
 ```
 
-The mapped values are then encoded with Golomb-Rice coding. Small movements are therefore cheap, which matches the way repeated decorative objects and nearby geometry are commonly placed.
+An image may occupy one through ten frames.
 
-### 6. Unsigned Exp-Golomb Coding
-
-Small non-negative values use unsigned Exp-Golomb coding where appropriate.
-
-This is used for values such as:
-
-- Command count
-- Text length
-- Radius minus one
-- Scale minus one
-- Other bounded shape parameters
-
-Small values consume fewer bits without requiring a fixed-width field large enough for the maximum.
-
-### 7. Nonadjacent Same-Opcode Repeat References
-
-A translated-repeat command can refer to the most recent compatible command of the same opcode, even when unrelated commands appear between them.
-
-Conceptually:
+The complete encoded payload capacity is therefore:
 
 ```text
-Star
-Radio
-Dish
-Star translated from previous Star
+10 × 135 = 1350 Base91 payload characters
 ```
 
-The second star can reuse the earlier star's shape, color, and non-coordinate fields while transmitting only a compact translation.
-
-A repeat is valid only when:
-
-- The referenced command has the same opcode.
-- Required non-coordinate fields are compatible.
-- Coordinate pairs differ by one consistent translation.
-- The translated result remains valid on the canvas.
-
-This preserves normal artistic layering while recovering much of the compression benefit that would otherwise require grouping identical shapes together.
-
-### 8. Text Encoding
-
-Text is uppercased and restricted to the protocol's six-bit text alphabet:
-
-```text
- 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-+./?:,()[]#_=@
-```
-
-The maximum text length is 31 characters.
-
-Unsupported characters are normalized rather than transmitted as arbitrary Unicode.
-
-### 9. Byte Packing and Base91
-
-The bitstream is packed into bytes, protected by a stream CRC-32, and encoded as Base91 text. The encoded text is then split across the required number of MeshCore frames.
-
-## Integrity and Retransmission
-
-MCoreIMG assumes that reliability is provided through acknowledgement and selective retransmission.
-
-### Per-Frame CRC-16
-
-Every frame header includes a CRC-16 calculated over that frame's Base91 payload.
-
-A receiver can identify a corrupted part immediately and request retransmission of only that part.
-
-### Stream CRC-32
-
-After all parts are collected and reassembled, the reconstructor Base91-decodes the complete payload and verifies the CRC-32 appended to the compressed stream.
-
-This detects corruption or incorrect assembly that survives individual frame checks.
-
-### Duplicate Handling
-
-Identical retransmissions of the same frame part may be ignored.
-
-Two frames claiming the same image ID and part index but containing different payloads are a conflict and must not be silently accepted.
-
-### Missing Parts
-
-The image cannot be decoded until all declared parts are present.
-
-Frames may arrive out of order because the part index determines assembly order.
-
-## Receiver Behavior
-
-A compatible receiver should:
-
-1. Ignore unrelated MeshCore messages.
-2. Search incoming text for a complete `MCI` frame.
-3. Read the declared payload length from the header.
-4. Validate the frame length and Base91 alphabet.
-5. Validate the frame CRC-16.
-6. Group frames by image ID and total-part count.
-7. Ignore identical duplicate retransmissions.
-8. Reject conflicting duplicates.
-9. Wait for every required part.
-10. Reassemble payloads by part index.
-11. Base91-decode the assembled payload.
-12. Validate the stream CRC-32.
-13. Decode commands in order.
-14. Render commands in order on a 720 × 480 canvas.
-
-The reference reconstructor can also extract an MCoreIMG frame from a log line that contains a timestamp, sender name, or other text before the frame.
-
-## Compatibility Rules
-
-Constructor and reconstructor implementations must agree on all of the following:
+Transport frames begin with `MCI` and include:
 
 - Protocol version
+- Image identifier
+- Frame index
+- Total frame count
+- Frame integrity information
+- Encoded payload segment
+
+The codec applies:
+
+- CRC-16 to individual frames
+- CRC-32 to the complete binary stream
+
+A corrupted, missing, duplicated, incompatible, or incomplete frame set is rejected rather than rendered silently.
+
+ACK handling and retransmission are transport/application responsibilities. The codec provides the frame numbering and corruption detection needed to request a missing or damaged frame.
+
+## File Formats
+
+### SVG and SVGZ
+
+Original authoring input. SVGZ is gzip-compressed SVG.
+
+### MCoreIMG Source JSON
+
+`.mci.json` is the editable intermediate format.
+
+It stores:
+
+- Source format and source version
+- Protocol version
 - Canvas dimensions
-- Opcode assignments
-- Shape geometry
-- Color table and color indexes
-- Text alphabet
-- Stateful-field behavior
-- Coordinate prediction rules
-- Rice parameters
-- Exp-Golomb interpretation
-- Repeat-reference semantics
-- Base91 alphabet
-- CRC algorithms
-- Frame-header layout
+- Source name
+- Document scale
+- Document offsets
+- Ordered vector commands
+- Fill and stroke styles
+- Geometry
+- Labels
+- Visibility
+- Import warnings
 
-Changing any item that affects decoding should require a protocol-version change unless backward compatibility is explicitly implemented.
+This file is not intended for transmission over MeshCore.
 
-Source-format versioning and compressed-protocol versioning are separate concerns.
+### MCoreIMG Transport
 
-## Capacity
+`.mci` contains one complete transport frame per line.
 
-The absolute text payload ceiling is:
+Example structure:
 
 ```text
-5 frames × 135 payload characters = 675 Base91 characters
+MCI...
+MCI...
+MCI...
 ```
 
-The practical number of drawable commands varies greatly.
+The payload should be treated as opaque transport text. Manually editing a frame will normally invalidate its CRC.
 
-Images compress best when they contain:
+### PNG
 
-- Repeated colors
-- Repeated shape parameters
-- Nearby coordinates
-- Repeated translated objects
-- Macro shapes
-- Small scales and radii
-- Short text
+The constructor exports previews, and the reconstructor produces the received image.
 
-Images compress poorly when every command changes opcode, color, dimensions, and location unpredictably.
+Protocol 3 output is RGBA. Protocol 2 output is opaque RGB.
 
-The constructor displays live codec statistics and refuses transport export when an image exceeds the five-frame profile.
+## Protocol Compatibility
 
-## Design Guidance
+| Protocol | Palette | Alpha | Source version | Reconstructor support |
+|---:|---|---|---:|---|
+| 2 | RGB565 | No | 1 | Supported |
+| 3 | RGB565+A4 | Yes | 2 | Preferred |
 
-For better compression without deliberately drawing in an unnatural order:
+A protocol-2-only reconstructor cannot decode protocol-3 transport.
 
-- Reuse a small color palette.
-- Duplicate and move existing objects when appropriate.
-- Keep repeated shapes geometrically identical.
-- Use macro shapes instead of rebuilding them from many lines.
-- Prefer nearby placement when the composition permits it.
-- Keep text short.
-- Watch the live frame count while editing.
+The protocol-aware reconstructor detects the protocol from transport frames and loads a matching constructor core. When a matching core cannot be found, it reports the searched and rejected candidates.
 
-Do not reorder layers solely to improve compression unless the visual result remains correct. Opcode-local state and same-opcode repeat references exist specifically to reduce that pressure.
+Keep the constructor beside the reconstructor, or use:
 
-## Legacy EMEIMG Relationship
-
-EMEIMG used fixed 13-character drawing packets with explicit command-order indexes. That design was easy to inspect manually but spent characters repeatedly transmitting structure and had a hard shape-count limit tied to its order field.
-
-MCoreIMG changes the model:
-
-| EMEIMG | MCoreIMG |
-|---|---|
-| Independent fixed-length commands | One compressed stateful stream |
-| Base36-oriented fields | Bit-level coding plus Base91 transport |
-| Explicit draw-order character | Stream order is draw order |
-| Repeated values retransmitted | Stateful reuse flags |
-| Mostly absolute fields | Absolute or predicted values |
-| Adjacent packet model | Nonadjacent same-opcode references |
-| Packet repetition for resilience | ACK and selective retransmission |
-| Up to 36 indexed commands | Command count limited mainly by compressed capacity |
-
-Legacy EMEIMG files are source material for conversion, not wire-compatible MCoreIMG messages.
-
-## Security and Privacy
-
-MCoreIMG is an image representation and framing protocol. It does not provide its own encryption, authentication, or sender verification.
-
-When transmitted through MeshCore, privacy and sender identity depend on the surrounding MeshCore configuration and application behavior.
-
-CRC values detect accidental corruption. They do not prevent intentional modification.
-
-## Current Limitations
-
-- Maximum of five frames under the current transport profile
-- Fixed 720 × 480 canvas
-- Fixed opcode and color tables
-- Restricted uppercase text alphabet
-- No arbitrary fonts
-- No raster-image embedding
-- No alpha channel
-- No gradients
-- No animation
-- No built-in forward-error correction
-- No cryptographic authentication
-- Protocol is still pre-alpha
-
-## Development Notes
-
-Before changing codec behavior:
-
-1. Update the constructor and reconstructor together.
-2. Increase the protocol version when old streams would decode differently.
-3. Add or update a round-trip test.
-4. Test frame corruption and missing-frame errors.
-5. Test duplicate and conflicting duplicate behavior.
-6. Test source JSON save and reload.
-7. Test PNG rendering parity.
-8. Test a realistic image that alternates opcodes.
-9. Test nonadjacent same-opcode translated repeats.
-10. Confirm the exported stream still fits the intended MeshCore profile.
-
-A useful minimum compatibility test is:
-
-```text
-commands
-  -> encode
-  -> frame
-  -> parse frames
-  -> assemble
-  -> decode
-  -> compare every reconstructed command
+```bash
+--core /path/to/matching-constructor.py
 ```
 
-## Status
+## Self-Tests
 
-MCoreIMG is an experimental low-bandwidth image protocol and editor. It is intended for practical experimentation with transmitting simple vector graphics through very constrained text-message channels.
+Run the constructor test:
 
-Expect the format to evolve while compression methods, mobile integration, acknowledgement behavior, and real MeshCore transport are tested.
+```bash
+python MCoreIMG-SVG-Constructor.py --self-test
+```
+
+Run the protocol-3 reconstructor test:
+
+```bash
+python MCoreIMG-Reconstructor.py --protocol 3 --self-test
+```
+
+Run the protocol-2 compatibility test when an appropriate protocol-2 core is present:
+
+```bash
+python MCoreIMG-Reconstructor.py --protocol 2 --self-test
+```
+
+The current tests cover important regression areas, including:
+
+- Encoder/decoder command round trips
+- Source JSON round trips
+- Maximum ten-frame envelope behavior
+- Exact 150-character frame limits
+- SVG default fitting
+- Open-subpath fill semantics
+- RGB565+A4 alpha preservation
+- Alpha compositing
+- Constructor/reconstructor render parity
+- Repeat-reference decoding
+- Frame corruption rejection
+- Stream CRC rejection
+
+A basic syntax check can also be run before committing:
+
+```bash
+python -m py_compile MCoreIMG-SVG-Constructor.py MCoreIMG-Reconstructor.py
+```
+
+## Known Limitations
+
+- This is a practical SVG subset, not a complete SVG implementation.
+- SVG text is not transported as text.
+- Embedded raster images are not supported.
+- Filters are not supported.
+- Masks and clip paths are not currently represented.
+- Gradients and patterns may be approximated rather than reproduced.
+- Arc commands are flattened into line segments.
+- Bezier paths are rasterized through flattened geometry.
+- RGB is quantized to RGB565.
+- Alpha is quantized to four bits.
+- Images with more than 32 required palette entries must be simplified or quantized further.
+- Artwork extending outside 720 × 480 must be fitted or resized before export.
+- Artwork requiring more than ten frames cannot be exported under the current MeshCore profile.
+- Original SVG IDs, labels, CSS structure, and authoring metadata are not fully transmitted.
+- A reconstructed `.mci.json` file cannot restore authoring details that were never included in transport.
+- Pre-alpha protocol changes may make older `.mci` files incompatible.
+
+## Suggestions for Smaller Transmissions
+
+To reduce frame count:
+
+- Remove invisible or redundant objects.
+- Simplify paths before import.
+- Reduce unnecessary path nodes.
+- Reuse the same colors.
+- Avoid tiny visual details.
+- Prefer repeated geometry where possible.
+- Convert complex gradients into a few flat colors.
+- Merge overlapping shapes when that does not change the image.
+- Remove off-canvas geometry.
+- Avoid excessive stroke-width variation.
+- Test whether reduced alpha variation is visually acceptable.
+
+MCoreIMG compression works best with deliberately simple illustration-style artwork.
+
+## Merge Checklist
+
+Before merging the SVG integration branch:
+
+- [ ] Rename versioned development files to the intended canonical filenames.
+- [ ] Confirm the constructor reports protocol 3.
+- [ ] Confirm the reconstructor prefers protocol 3 and supports protocol 2.
+- [ ] Run both self-tests.
+- [ ] Run `py_compile`.
+- [ ] Import a representative SVG with paths and opacity.
+- [ ] Confirm constructor preview and exported PNG match.
+- [ ] Export the image to `.mci`.
+- [ ] Reconstruct the `.mci` into PNG.
+- [ ] Confirm alpha survives the complete round trip.
+- [ ] Confirm the image remains within ten 150-character messages.
+- [ ] Commit the updated README with the constructor and reconstructor together.
+
+## Project Direction
+
+The goal is not to reproduce every feature of SVG. The goal is to identify the smallest useful vector feature set that lets a human create recognizable artwork and transmit it through MeshCore without manually writing or optimizing the compressed stream.
+
+The constructor should absorb the complexity. The operator should be able to import or create artwork normally, see whether it fits, and export a validated transport that the reconstructor can reproduce consistently.

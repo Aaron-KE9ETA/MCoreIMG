@@ -2,36 +2,312 @@
 from __future__ import annotations
 """
 MCoreIMG Hybrid Constructor — protocol-v5 local-space SVG + old drawing branch
-=========================================================
+===============================================================================
 
-A standalone Constructor for importing, scaling, editing, previewing, saving,
-and encoding a practical SVG subset for MCoreIMG over MeshCore.
+This file is both the GUI Constructor and the reference encoder for MCoreIMG
+protocol version 5.  It imports a practical SVG subset, combines imported SVGs
+with compact legacy drawing primitives, previews the transport-visible result,
+and emits at most ten 150-character MeshCore messages.
 
-Highlights
-----------
-* Opens or appends multiple SVG/SVGZ/MCoreIMG source files without replacing current artwork.
-* Fits imported SVG artwork inside the fixed 720x480 canvas by default.
-* Keeps document scale and offset non-destructive until explicitly baked.
-* Supports rect, circle, ellipse, line, polyline, polygon, and SVG path.
-* Supports nested transforms and inherited flat fill/stroke styles.
-* Normalizes path H/V/S/T commands and approximates SVG arcs with line nodes.
-* Uses a per-image RGB565+A4 palette, opcode-local style/point state, predictive
-  coordinates, Exp-Golomb/Rice coding, and nonadjacent translated repeats.
-* Uses a ten-by-150-character MeshCore envelope with Base91,
-  per-frame CRC-16, and stream CRC-32.
+The comments in this build are intentionally extensive.  They are aimed at a
+future maintainer who needs to reconcile the technical debt created while the
+protocol evolved rapidly from the original vector-only branch through the
+hybrid primitive branch and finally into local-space SVG groups.
 
-Protocol v5 retains compact old drawing primitives, automatic primitive-vs-vector
-comparison, alpha, undo, and repeated-SVG references. Imported SVG groups are
-encoded in stable local coordinates with fixed-width placement transforms, so
-resizing artwork no longer changes its frame count.
+
+MAINTAINER ORIENTATION
+----------------------
+
+The most important fact about this source file is that it contains several
+historical implementation layers.  Python resolves a global name at runtime,
+and a later ``def`` or ``class`` statement replaces an earlier object with the
+same name.  Therefore, the last definition of ``encode_commands``,
+``decode_commands``, ``encode_image``, ``CodecStats``, ``ConstructorApp``, and
+``run_self_test`` is the active implementation.
+
+That layering is deliberate for now because it allowed the branch to retain a
+working foundation while new protocol experiments were added.  It is also the
+largest remaining source of technical debt.  Do not edit the first function
+with a familiar name and assume it is live.  Search from the bottom upward or
+use ``inspect.getsource``/``__qualname__`` while debugging.
+
+Approximate source map:
+
+1. CORE VECTOR/SVG FOUNDATION
+   - Data model, matrix math, SVG parsing, path normalization, renderer,
+     original stateful point codec, Base91 framing, and the first GUI.
+   - Some of these definitions remain active helpers; some are superseded.
+
+2. HYBRID PRIMITIVE / REPEAT FOUNDATION
+   - Adds ``OP_PRIMITIVE`` and the legacy/manual shapes.
+   - Adds exact primitive-versus-vector bit-cost comparison.
+   - Adds single-command and translated contiguous-group references.
+   - Redefines several codec and geometry helpers.
+
+3. PROTOCOL-V5 LOCAL-SPACE SVG LAYER
+   - Adds ``REC_TRANSFORM_GROUP``.
+   - Normalizes a contiguous imported SVG group into a stable local box.
+   - Sends a fixed-width display box separately from the local geometry.
+   - Reuses identical local definitions for copied SVG instances.
+   - Redefines the active codec and image encoder.
+
+4. HYBRID GUI LAYER
+   - Adds multi-SVG import and the Old Drawing Mode.
+   - Adds editor-only grouping for imported SVGs.
+
+5. FINAL DIRECT-EDITING / UNDO GUI LAYER
+   - The last ``ConstructorApp`` is the class instantiated by ``main``.
+   - Adds drag-to-move, drag-to-scale, color selection, duplication, and undo.
+
+6. FINAL REGRESSION TESTS AND ENTRY POINT
+   - The last ``run_self_test`` is authoritative.
+   - ``verify_build_integrity`` guards the required feature set before startup.
+
+
+END-TO-END DATA FLOW
+--------------------
+
+The normal path from source file to radio messages is:
+
+    SVG/XML or editable JSON
+        -> VectorDocument
+        -> ordered VectorCommand objects
+        -> editor/document transforms
+        -> primitive representation planning
+        -> local-space SVG group planning
+        -> palette construction (RGB565 + 4-bit alpha)
+        -> record selection and bit writing
+        -> stream CRC-32
+        -> Base91
+        -> 1..10 framed MeshCore messages, each with CRC-16
+
+The preview and PNG export intentionally decode the encoded stream when the
+image fits.  This is a major invariant: the GUI should show the result the
+Reconstructor will receive, including palette quantization, local-coordinate
+precision, alpha quantization, and command expansion.
+
+
+COORDINATE SPACES
+-----------------
+
+There are three coordinate spaces.  Confusing them previously caused the bug
+where a smaller displayed SVG required fewer messages.
+
+1. SVG SOURCE SPACE
+   Coordinates from the SVG's viewBox before import normalization.
+
+2. CANVAS / DISPLAY SPACE
+   The fixed 720 x 480 editor and reconstructed image space.  Generic vector
+   commands and compact primitives ultimately render here.
+
+3. LOCAL GROUP SPACE
+   A normalized integer coordinate box used only for protocol-v5 imported SVG
+   groups.  The geometry is stable when the user drags or scales the group.
+   A fixed-width transform box carries x, y, width, and height separately.
+
+The defining invariant is:
+
+    changing only a local SVG group's displayed position or displayed size
+    must not change the encoded local geometry bit count.
+
+A small Base91 length variation may still occur because byte padding and CRC
+values alter the final text representation, but the underlying geometry bits
+and frame count should remain stable.
+
+
+TRANSPORT RECORD TYPES
+----------------------
+
+Every command-stream record begins with two bits:
+
+    REC_NORMAL          regular opcode/style/geometry record
+    REC_SINGLE_REPEAT   repeat the most recent command of one opcode + dx/dy
+    REC_GROUP_REPEAT    repeat an earlier contiguous command range + dx/dy
+    REC_TRANSFORM_GROUP protocol-v5 local SVG definition or definition ref
+
+``REC_TRANSFORM_GROUP`` reuses the old reserved record value.  A transform
+record carries a display box and either:
+
+- a new local command definition, or
+- an index referring to an identical earlier local definition.
+
+Definitions are stream-local.  Their numeric index is meaningful only while
+decoding one image and must never be persisted as editor metadata.
+
+
+COMPRESSION DECISION ORDER
+--------------------------
+
+Compression is not selected from fixed estimates.  The encoder simulates real
+bitstreams and chooses representations based on actual bit count in context.
+The current order is roughly:
+
+1. For every manual primitive, compare the compact primitive record with its
+   deterministic generic-vector expansion.  Keep the smaller representation.
+2. Detect contiguous editor groups eligible for local-space SVG records.
+3. Reuse an identical earlier local definition when possible.
+4. For non-local commands, test translated contiguous-group references.
+5. Otherwise compare a single-opcode repeat with a normal record.
+
+Because codec state affects cost, changing this order can change compression.
+Any reordering needs regression images, not only isolated unit tests.
+
+
+EDITOR METADATA VERSUS TRANSPORT DATA
+-------------------------------------
+
+``VectorCommand.editor_group`` exists only to make imported SVGs behave as one
+object in the GUI and to identify contiguous local-space candidates.  It is
+saved in editable source JSON, but is not itself transmitted as an image
+field.  The encoder infers records from command order and group boundaries.
+
+Important group assumptions:
+
+- Commands belonging to one imported SVG should remain contiguous.
+- Layer reordering can split a group and therefore disable local-group reuse.
+- A primitive is intentionally excluded from local SVG groups.
+- Direct editing may bake the document-level transform so object manipulation
+  happens in one predictable canvas coordinate system.
+
+
+COLOR AND ALPHA
+---------------
+
+Colors are normalized to ``#RRGGBB`` or ``#RRGGBBAA`` strings.  Transmission
+uses RGB565 plus A4:
+
+- 16 bits for red/green/blue (5/6/5)
+- 4 bits for alpha (0..15)
+
+The renderer uses source-over compositing in draw order.  Never pre-blend a
+transparent SVG color against white during import; doing so destroys overlap
+information.  Color chooser operations preserve the existing alpha nibble
+when only RGB is changed.
+
+
+FRAME ENVELOPE
+--------------
+
+The message profile is intentionally separate from the vector codec:
+
+- maximum messages: 10
+- message length: 150 characters
+- frame header: 15 characters
+- maximum payload text: 1,350 Base91 characters
+- per-frame CRC: CRC-16 over the text chunk
+- stream CRC: CRC-32 over encoded bytes
+
+The frame header also carries protocol version, image ID, part index, total
+parts, and chunk length.  A decoder must reject mixed image IDs, duplicate or
+missing parts, invalid lengths, unsupported versions, and either CRC failure.
+
+
+ERROR-HANDLING PRINCIPLES
+-------------------------
+
+``MCIError`` means valid program flow reached invalid MCoreIMG data or editor
+state.  ``SVGImportError`` adds source-import context.  ``FrameError`` means
+the text envelope is damaged or inconsistent.
+
+Decoder limits are security and reliability boundaries, not conveniences.
+Keep maximum counts and coordinate bounds when refactoring.  A corrupt radio
+message must fail quickly rather than allocate an unbounded structure.
+
+
+TESTING EXPECTATIONS
+--------------------
+
+Before distributing a modified Constructor, run:
+
+    python <file>.py --version
+    python <file>.py --self-test
+
+The final self-test covers at least:
+
+- protocol and frame-profile constants
+- encode/decode round trips
+- alpha preservation and compositing
+- full ten-message framing and corruption rejection
+- primitive-versus-vector decisions
+- translated group-copy records
+- local-space scaling invariance
+- copied local-definition references
+- required GUI feature presence through ``verify_build_integrity``
+
+For UI work, also launch the application and manually check:
+
+- import one SVG and several SVGs
+- drag a whole imported group
+- scale with the blue handle
+- draw and color a primitive
+- undo the import and drawing action
+- preview frames and export PNG
+
+
+KNOWN TECHNICAL DEBT
+--------------------
+
+1. DUPLICATE DEFINITIONS
+   The file should eventually be split into modules and each active symbol
+   should have one definition.  Until then, comments marked ``ACTIVE V5`` and
+   ``SUPERSEDED FOUNDATION`` describe which layer wins.
+
+2. GLOBAL LOCAL_GROUP_EXTENT
+   ``_encode_image_once_v5`` temporarily mutates this global to test precision
+   candidates.  The GUI is single-threaded, so it is currently safe, but this
+   is not reentrant or thread-safe.  Pass an explicit codec-options object in a
+   future cleanup.
+
+3. DICTIONARY-SHAPED GEOMETRY
+   ``VectorCommand.geom`` is flexible but weakly typed.  Dedicated dataclasses
+   or tagged immutable records would move many runtime checks to type checking.
+
+4. GUI INHERITANCE STACK
+   The final ConstructorApp subclasses an earlier ConstructorApp that already
+   subclasses the base GUI.  This preserves behavior but obscures method
+   resolution.  Collapse it after protocol work stabilizes.
+
+5. IMPORT AND PROTOCOL COUPLING
+   SVG normalization, editor grouping, and transport planning live in one file.
+   Separating importer, model, optimizer, codec, renderer, and GUI would make
+   tests smaller and protocol compatibility easier to reason about.
+
+6. GREEDY RECORD PLANNING
+   The encoder performs local comparisons and bounded group searches rather
+   than a global dynamic-programming optimum.  It is practical for the message
+   budget, but future changes should preserve deterministic runtime limits.
+
+7. RASTER PREVIEW COST
+   The GUI re-encodes and decodes frequently to preserve preview parity.  Large
+   SVGs can make dragging expensive.  A debounced preview or cached local
+   definitions would improve responsiveness without changing transport data.
+
+
+SAFE REFACTORING ORDER
+----------------------
+
+A lower-risk cleanup sequence is:
+
+1. Freeze protocol-v5 regression fixtures and expected decoded command lists.
+2. Extract pure data classes and matrix/color helpers.
+3. Extract SVG import and rendering.
+4. Extract bitstream/framing utilities.
+5. Move the active v5 encoder/decoder only; do not carry superseded functions.
+6. Replace editor inheritance layers with one GUI class.
+7. Replace mutable globals with an explicit CodecConfig.
+8. Remove the historical definitions only after all fixtures match.
+
+Do not combine a structural cleanup with a protocol-format change.  Those are
+two separate review problems and should be committed separately.
+
 
 Run:
-    python MCoreIMG-SVG-Constructor.py
+    python MCoreIMG-SVG-Constructor-v5.1-DOCUMENTED.py
 
 Self-test:
-    python MCoreIMG-SVG-Constructor.py --self-test
+    python MCoreIMG-SVG-Constructor-v5.1-DOCUMENTED.py --self-test
 
-Arch Linux:
+Arch Linux dependencies:
     sudo pacman -Syu python tk python-pillow
 """
 
@@ -64,22 +340,36 @@ except ImportError:
 # Protocol and editor constants
 # ---------------------------------------------------------------------------
 
+# Canvas dimensions are part of the current protocol profile. Generic vector
+# coordinates are validated against these bounds, while local SVG definitions
+# use their own normalized coordinate box plus a display transform.
 CANVAS_W = 720
 CANVAS_H = 480
+
+# BACKGROUND affects preview/export compositing but is not transmitted as an
+# explicit command. A future configurable background would need either a
+# protocol field or an agreed Reconstructor default.
 BACKGROUND = "#FFFFFF"
 DEFAULT_MARGIN = 8
+
+# PROTOCOL_VERSION is written into both the bitstream and every frame header.
+# SOURCE_VERSION belongs only to editable JSON and may evolve independently.
 PROTOCOL_VERSION = 5
 SOURCE_FORMAT = "MCoreIMG-SVG-source"
 SOURCE_VERSION = 5
-CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-LOCALSPACE-HYBRID-VERIFIED-10MSG"
+CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-DOCUMENTED-LOCALSPACE-HYBRID-10MSG"
 FEATURE_SIGNATURE = "PROTO5|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG"
 
+# MeshCore transport profile. Keep the arithmetic expressed in one place so
+# GUI counters, encoder limits, and decoder validation cannot drift apart.
 MAX_MESSAGES = 10
 MESSAGE_LEN = 150
 FRAME_HEADER_LEN = 15
 FRAME_PAYLOAD_LEN = MESSAGE_LEN - FRAME_HEADER_LEN
 MAX_PAYLOAD_CHARS = MAX_MESSAGES * FRAME_PAYLOAD_LEN
 FRAME_MAGIC = "MCI"
+
+# Defensive decoder limits. These cap allocation and malformed-count loops.
 MAX_COMMANDS = 2048
 MAX_PALETTE = 32
 
@@ -122,14 +412,20 @@ CSS_NAMED_FALLBACK = {
 
 
 class MCIError(ValueError):
+    """Base exception for invalid MCoreIMG model, codec, or stream data."""
+
     pass
 
 
 class SVGImportError(MCIError):
+    """Raised when SVG/XML cannot be normalized into the supported model."""
+
     pass
 
 
 class FrameError(MCIError):
+    """Raised for damaged, incomplete, mixed, or inconsistent text frames."""
+
     pass
 
 
@@ -140,6 +436,14 @@ class FrameError(MCIError):
 
 @dataclass
 class PaintStyle:
+    """Transport-visible paint state shared by generic and primitive commands.
+
+    ``fill`` and ``stroke`` are normalized RGB/RGBA strings or ``None``.
+    ``stroke_width`` is a canvas-space width before final quantization.
+    ``fill_rule`` is retained because compound SVG paths can require even-odd
+    filling to preserve holes.
+    """
+
     fill: Optional[str] = "#000000"
     stroke: Optional[str] = None
     stroke_width: float = 1.0
@@ -171,6 +475,13 @@ class PaintStyle:
 
 @dataclass
 class VectorCommand:
+    """One ordered drawing operation in the editor/intermediate model.
+
+    ``geom`` is opcode-specific. ``editor_group`` is GUI/source metadata used
+    to move an imported SVG as one object and to propose local-space groups; it
+    is not directly serialized into the radio command stream.
+    """
+
     opcode: int
     style: PaintStyle
     geom: Dict[str, Any]
@@ -211,6 +522,13 @@ class VectorCommand:
 
 @dataclass
 class VectorDocument:
+    """Editable document plus one non-destructive document-level transform.
+
+    Individual object edits normally bake this transform first. Keeping it at
+    document level is convenient for Fit/Center operations and source JSON,
+    while protocol-v5 local SVG transforms are planned later by the encoder.
+    """
+
     commands: List[VectorCommand] = field(default_factory=list)
     scale: float = 1.0
     offset_x: float = 0.0
@@ -1873,8 +2191,19 @@ def run_self_test():
 
 
 # ---------------------------------------------------------------------------
-# Hybrid drawing / primitive / copied-SVG foundation
+# HYBRID OVERRIDE LAYER: primitives and repeated command groups
 # ---------------------------------------------------------------------------
+#
+# IMPORTANT MAINTENANCE NOTE
+# --------------------------
+# This block intentionally redefines several helpers and codec entry points
+# from the vector-only foundation above. From this point onward, later global
+# definitions supersede earlier ones. The earlier code remains useful as the
+# imported-SVG/model/rendering foundation and as historical reference, but the
+# final encoder is defined below in the protocol-v5 layer.
+#
+# Refactor target: extract only the final active definitions into a codec_v5
+# module, then delete the superseded implementations after fixture parity.
 
 # The hybrid foundation keeps the RGB565+A4 palette and ten-message envelope, and
 # adds two orthogonal compression tools:
@@ -1884,7 +2213,7 @@ def run_self_test():
 #     command groups, including nonadjacent copies.
 PROTOCOL_VERSION = 5
 SOURCE_VERSION = 5
-CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-LOCALSPACE-HYBRID-VERIFIED-10MSG"
+CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-DOCUMENTED-LOCALSPACE-HYBRID-10MSG"
 
 OP_PRIMITIVE = 6
 OP_NAMES[OP_PRIMITIVE] = "Primitive"
@@ -2901,15 +3230,25 @@ def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
 
 
 # ---------------------------------------------------------------------------
-# Protocol-v5 local-space SVG groups
+# ACTIVE PROTOCOL-V5 OVERRIDE: local-space SVG groups
 # ---------------------------------------------------------------------------
+#
+# The definitions in this section are the active transport implementation.
+# In particular, the later CodecStats, encode_commands, decode_commands, and
+# encode_image replace same-named hybrid-foundation versions above.
+#
+# Local-space grouping solves a subtle vector-format problem: if every SVG
+# point is baked into canvas coordinates before compression, shrinking an SVG
+# produces numerically smaller deltas and falsely appears to compress better.
+# This layer instead normalizes geometry once and sends a fixed-width display
+# box. Display scale therefore does not determine geometry cost.
 # Imported SVGs are encoded once in a stable local coordinate space. Their
 # displayed position and size are carried in a fixed-width transform box.
 # Consequently, dragging or scaling an SVG does not make its path coordinates
 # cheaper or more expensive, and repeated SVGs can reuse the same definition.
 PROTOCOL_VERSION = 5
 SOURCE_VERSION = 5
-CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-LOCALSPACE-HYBRID-VERIFIED-10MSG"
+CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-DOCUMENTED-LOCALSPACE-HYBRID-10MSG"
 
 REC_TRANSFORM_GROUP = REC_RESERVED
 LOCAL_GROUP_EXTENT = 255
@@ -2917,6 +3256,15 @@ LOCAL_GROUP_EXTENT = 255
 
 @dataclass
 class _TransformGroupPlan:
+    """Encoder plan for one contiguous imported-SVG command run.
+
+    ``start:end`` indexes the transport-planned display command list.
+    ``local_commands`` are normalized and scale-independent.
+    ``display_commands`` are the quantized reconstruction used for history and
+    preview parity. ``signature`` identifies reusable local definitions and
+    deliberately excludes x/y/display width/display height.
+    """
+
     start: int
     end: int
     local_commands: List[VectorCommand]
@@ -2932,6 +3280,13 @@ class _TransformGroupPlan:
 
 @dataclass
 class _DecoderStateV5:
+    """Mutable decode/encode history shared by normal and repeat records.
+
+    Point and style state are opcode-local. ``recent`` stores the latest fully
+    reconstructed command for each opcode. ``previous_opcode`` supports the
+    one-bit same-opcode shortcut used by normal records.
+    """
+
     point_states: Dict[int, PointState] = field(default_factory=lambda: {op: PointState() for op in OP_NAMES})
     style_states: Dict[int, PaintStyle] = field(default_factory=dict)
     recent: Dict[int, VectorCommand] = field(default_factory=dict)
@@ -2953,6 +3308,12 @@ def _all_transport_points_v5(command: VectorCommand) -> List[Tuple[float, float]
 
 
 def _geometry_bbox_v5(commands: Sequence[VectorCommand]) -> Tuple[float, float, float, float]:
+    """Bounds for normalization, including path control points.
+
+    This differs from visual bounds. Control points must be included because
+    they are encoded and must remain inside the advertised local coordinate
+    box even when a Bézier curve never reaches the control point itself.
+    """
     points = [point for command in commands for point in _all_transport_points_v5(command)]
     if not points:
         return 0.0, 0.0, 0.0, 0.0
@@ -2962,6 +3323,12 @@ def _geometry_bbox_v5(commands: Sequence[VectorCommand]) -> Tuple[float, float, 
 
 
 def _group_transport_signature_v5(commands: Sequence[VectorCommand], local_width: int, local_height: int) -> str:
+    """Create a deterministic identity for reusable local geometry.
+
+    Placement is intentionally absent. Two copies at different positions or
+    display sizes should share one definition when their normalized commands,
+    styles, and local dimensions match.
+    """
     payload = {
         "w": int(local_width),
         "h": int(local_height),
@@ -2978,6 +3345,14 @@ def _group_transport_signature_v5(commands: Sequence[VectorCommand], local_width
 
 
 def _make_transform_group_v5(commands: Sequence[VectorCommand], start: int, end: int) -> Optional[_TransformGroupPlan]:
+    """Normalize one eligible contiguous command run into local coordinates.
+
+    Returns ``None`` for runs that are too short, contain compact primitives,
+    or have degenerate width/height. The caller may then encode those commands
+    using normal/repeat records. This function performs lossy integer
+    quantization at the selected local extent; preview parity depends on using
+    ``display_commands`` reconstructed from the same quantized definition.
+    """
     group = [command.clone() for command in commands[start:end]]
     if len(group) < 2 or any(command.opcode == OP_PRIMITIVE for command in group):
         return None
@@ -3051,6 +3426,12 @@ def _apply_transform_group_v5(
 
 
 def _write_transform_box_v5(w: BitWriter, plan: _TransformGroupPlan) -> None:
+    """Write fixed-width display and local-box dimensions.
+
+    Fixed width is intentional: moving or resizing a group changes values but
+    not field length. Canvas dimensions explain the 10/9-bit x/y and width/
+    height fields; local dimensions fit in eight bits.
+    """
     w.bits_n(plan.x, 10)
     w.bits_n(plan.y, 9)
     w.bits_n(plan.width - 1, 10)
@@ -3060,6 +3441,7 @@ def _write_transform_box_v5(w: BitWriter, plan: _TransformGroupPlan) -> None:
 
 
 def _read_transform_box_v5(r: BitReader) -> Tuple[int, int, int, int, int, int]:
+    """Read and validate a transform box before allocating/expanding geometry."""
     x = r.bits_n(10)
     y = r.bits_n(9)
     width = r.bits_n(10) + 1
@@ -3078,6 +3460,12 @@ def _local_bits_v5(maximum: int) -> int:
 def _write_local_point_v5(
     w: BitWriter, state: PointState, point: Tuple[int, int], local_width: int, local_height: int,
 ) -> None:
+    """Write one local point using the cheaper absolute or Rice-delta form.
+
+    Unlike canvas points, the absolute bit width derives from the group's local
+    dimensions. Delta state remains opcode-local through the nested decoder
+    state used for the definition.
+    """
     x, y = int(point[0]), int(point[1])
     x_bits = _local_bits_v5(local_width)
     y_bits = _local_bits_v5(local_height)
@@ -3098,6 +3486,7 @@ def _write_local_point_v5(
 def _read_local_point_v5(
     r: BitReader, state: PointState, local_width: int, local_height: int,
 ) -> Tuple[int, int]:
+    """Inverse of _write_local_point_v5 with strict local-box validation."""
     if r.bit():
         if not state.initialized:
             raise MCIError("Local delta point before initialization.")
@@ -3116,6 +3505,12 @@ def _read_local_point_v5(
 def _write_local_geometry_v5(
     w: BitWriter, command: VectorCommand, state: PointState, local_width: int, local_height: int,
 ) -> None:
+    """Write generic vector geometry inside a local SVG definition.
+
+    Compact primitives are excluded before this function. Keeping local
+    definitions generic makes their signatures deterministic and lets the same
+    geometry be instantiated at several display sizes.
+    """
     g = command.geom
     point = lambda value: _write_local_point_v5(w, state, tuple(value), local_width, local_height)
     if command.opcode == OP_RECT:
@@ -3325,6 +3720,13 @@ class CodecStats:
         return self.frame_count <= MAX_MESSAGES
 
 
+# ACTIVE V5 COMMAND ENCODER
+# -------------------------
+# This is the final encode_commands definition. It first resolves primitive
+# representations, then identifies local SVG groups, then chooses repeat/normal
+# records for everything else. Metrics returned here feed both the status bar
+# and regression tests; add new metrics in CodecStats and preview_frames too.
+
 def encode_commands(commands: Sequence[VectorCommand]) -> Tuple[bytes, int, Dict[str, int], List[str]]:
     raw_source = [command.clone() for command in commands]
     palette = build_palette(raw_source)
@@ -3429,6 +3831,12 @@ def encode_commands(commands: Sequence[VectorCommand]) -> Tuple[bytes, int, Dict
     return w.to_bytes(), len(w.bits), metrics, palette
 
 
+# ACTIVE V5 COMMAND DECODER
+# -------------------------
+# Decoder record expansion must update history exactly as if the expanded
+# commands had arrived as normal records. Repeat/reference bugs often appear
+# only in a later command because stale opcode/style/point history survives.
+
 def decode_commands(data: bytes) -> Tuple[List[VectorCommand], List[str]]:
     r = BitReader(data)
     version = r.bits_n(4)
@@ -3519,6 +3927,12 @@ def decode_commands(data: bytes) -> Tuple[List[VectorCommand], List[str]]:
 
 
 def _encode_image_once_v5(commands: Sequence[VectorCommand], local_extent: int) -> EncodedImage:
+    """Encode once using a particular local-coordinate precision.
+
+    TODO(DEBT): this temporarily mutates LOCAL_GROUP_EXTENT. The application is
+    currently single-threaded, but an explicit CodecConfig should replace this
+    global before the codec is reused concurrently or as a library service.
+    """
     global LOCAL_GROUP_EXTENT
     previous_extent = LOCAL_GROUP_EXTENT
     LOCAL_GROUP_EXTENT = int(local_extent)
@@ -3545,6 +3959,13 @@ def _encode_image_once_v5(commands: Sequence[VectorCommand], local_extent: int) 
 
 
 def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
+    """Encode with the highest local-space precision that fits ten messages.
+
+    Images without eligible local groups take the direct path. For local SVG
+    groups, the precision ladder trades coordinate fidelity for payload size.
+    The first fitting candidate wins; if none fit, the smallest/last candidate
+    is returned so the GUI can report an honest over-limit result.
+    """
     # Keep as much local-coordinate precision as the ten-message budget allows.
     # The chosen precision depends on geometry complexity, never on displayed
     # scale, so resizing the same SVG leaves its payload and frame count stable.
@@ -3721,7 +4142,11 @@ class MultiSVGPlacementDialog(tk.Toplevel):
         self.destroy()
 
 
-# ---- Hybrid GUI -----------------------------------------------------------
+# ---- HYBRID GUI LAYER ------------------------------------------------------
+# This first GUI subclass adds multi-SVG import and manual primitives. It is
+# not the final class instantiated by main(); the direct-editing/undo subclass
+# later in the file extends it. Keep this inheritance chain in mind when
+# changing _build_ui or methods also overridden later.
 
 
 class ConstructorApp(_BaseConstructorApp):
@@ -4003,7 +4428,13 @@ class ConstructorApp(_BaseConstructorApp):
             messagebox.showerror("Drawing command failed", str(exc), parent=self._manual_window)
 
 
-# ---- direct-manipulation editor --------------------------------------
+# ---- FINAL ACTIVE GUI LAYER: direct manipulation and undo -----------------
+# The ConstructorApp defined below is the one main() instantiates. It extends
+# the hybrid GUI rather than replacing its implementation wholesale. Method
+# lookup therefore flows: final editor -> hybrid GUI -> original base GUI.
+#
+# TODO(DEBT): collapse these layers into one class after behavior is covered by
+# UI tests. Until then, always check super() before assuming a method is local.
 
 
 _HybridConstructorApp = ConstructorApp
@@ -4065,6 +4496,10 @@ class ConstructorApp(_HybridConstructorApp):
     def _document_changed(self, before: VectorDocument) -> bool:
         return self.doc.to_json() != before.to_json()
 
+    # Undo stores complete document snapshots rather than inverse operations.
+    # This costs memory but is robust while imports, groups, primitive creation,
+    # and transforms are still evolving. A command-pattern undo system is a
+    # future optimization, not a prerequisite for correctness.
     def _record_undo_snapshot(
         self,
         label: str,
@@ -4469,6 +4904,12 @@ def _transport_signature_v4(command: VectorCommand) -> Dict[str, Any]:
     }
 
 
+# FINAL ACTIVE REGRESSION SUITE
+# -----------------------------
+# Earlier run_self_test definitions belong to superseded layers. This final
+# function is the one main() invokes. Keep protocol fixtures here until the
+# code is split into modules and a conventional test package can replace it.
+
 def run_self_test():
     # Generic v5 round trip and alpha.
     base = sample_document()
@@ -4584,6 +5025,13 @@ def run_self_test():
 
 
 def verify_build_integrity() -> None:
+    """Fail at startup if a stale/superseded layer became active by accident.
+
+    This guard exists because the file contains intentional redefinitions.
+    It does not prove protocol correctness, but it catches the recurring class
+    of packaging mistakes where an older Constructor was distributed under a
+    newer filename.
+    """
     required = {
         "protocol": PROTOCOL_VERSION == 5,
         "messages": MAX_MESSAGES == 10,
@@ -4600,6 +5048,7 @@ def verify_build_integrity() -> None:
 
 
 def main(argv:Optional[Sequence[str]]=None)->int:
+    """CLI entry point for version reporting, regression tests, or the Tk GUI."""
     parser=argparse.ArgumentParser(description="MCoreIMG protocol-v5 local-space hybrid SVG and old drawing Constructor")
     parser.add_argument("--self-test",action="store_true")
     parser.add_argument("--version",action="store_true")

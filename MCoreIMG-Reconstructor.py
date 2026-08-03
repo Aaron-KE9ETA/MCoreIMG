@@ -4,28 +4,129 @@ from __future__ import annotations
 MCoreIMG Reconstructor — current Constructor compatibility adapter
 =================================================================
 
-Reconstructs MCoreIMG transport by loading the matching Constructor as the
-codec and rendering authority. The current Constructor is protocol 5 / source
-version 5 and uses local-space SVG groups, hybrid legacy primitives, translated
-group copies, RGB565+A4 alpha, and the ten-message MeshCore envelope.
+Purpose
+-------
+This program turns MCoreIMG transport frames back into a raster image.  It does
+*not* contain an independent copy of the MCoreIMG codec.  Instead, it discovers
+and imports the matching Constructor Python file, then treats that Constructor
+as the authority for decoding and rendering.
 
-Compatibility highlights
+That design is deliberate.  The MCoreIMG protocol is evolving quickly and the
+Constructor already owns the definitions that are easiest to accidentally let
+drift apart: opcodes, palette packing, alpha quantization, local-space SVG group
+semantics, translated-copy references, primitive selection, frame CRCs, and
+rendering order.  Reusing the Constructor makes the receiver track those rules
+without maintaining a second handwritten implementation.
+
+Current compatibility target
+----------------------------
+The current verified Constructor is protocol 5 / source version 5.  Its major
+features are:
+
+* Local-space SVG groups whose geometry is encoded once.
+* Fixed-width placement transforms used to move and scale those groups.
+* Hybrid legacy primitives and arbitrary SVG/vector commands.
+* Automatic primitive-versus-vector representation selection.
+* Translated group-copy references for repeated artwork.
+* RGB565+A4 palette entries and source-over alpha compositing.
+* A ten-message, 150-character MeshCore transport envelope.
+
+This adapter also retains best-effort support for matching protocol-v2, v3, and
+v4 Constructor cores.  Compatibility is selected by the protocol number in the
+input frame header or editable source JSON, not by filename alone.
+
+Architectural data flow
+-----------------------
+The normal transport path is:
+
+    input text/.mci
+        -> extract and validate complete MCI frames
+        -> read protocol number from frame header
+        -> discover a Constructor with the same PROTOCOL_VERSION
+        -> call the Constructor decoder through a compatibility adapter
+        -> preserve the complete decoded scene/result object
+        -> call the Constructor's authoritative Pillow renderer
+        -> save PNG and optionally export best-effort editable JSON
+
+The source-file path is similar, except that .mci.json, .json, .svg, and .svgz
+files are handed to the Constructor's source loader instead of the frame
+decoder.
+
+Why the adapter is dynamic
+--------------------------
+Several Constructor generations exposed equivalent operations under different
+names or object layouts.  For example, decoding may be a module-level
+``decode_frames`` function, a method on ``codec``, or a method on a no-argument
+``Codec`` class.  A decoder may return a list of commands, a document object, a
+scene wrapper, a mapping, or a tuple such as ``(commands, metadata)``.
+
+The adapter therefore discovers callable APIs by capability and normalizes only
+the minimum information needed by the CLI.  Most importantly, it keeps the raw
+decoder result intact.  Flattening everything immediately into a command list
+would discard protocol-local group tables, palette metadata, copy-reference
+state, and future scene-level information needed by the renderer.
+
+Compatibility invariants
 ------------------------
-* Prefers the current v5.1 local-space hybrid Constructor.
-* Detects the transport protocol directly from each MCI frame header.
-* Delegates protocol-v5 local-space groups and group-copy expansion to the
-  matching Constructor decoder, preserving draw order and displayed geometry.
-* Supports compact primitives and automatic primitive-versus-vector choices.
-* Preserves alpha by using the Constructor's authoritative Pillow renderer.
-* Supports canonical and versioned Constructor filenames.
-* Retains compatibility with older protocol-v2/v3/v4 Constructor cores.
-* Loads .mci, copied frame text, .mci.json, .json, .svg, and .svgz inputs.
-* Can export a best-effort editable source with --dump-json.
+When maintaining this file, preserve these rules:
 
-Keep this file beside MCoreIMG-Constructor.py / MCoreIMG-SVG-Constructor.py, or
-pass the exact Constructor path with --core.
+1. Never decode protocol N with a Constructor that declares another protocol.
+2. Prefer the current verified feature signature when several same-protocol
+   Constructor files are present.
+3. Treat ``--core`` as an exact override; do not silently substitute another
+   nearby file.
+4. Preserve the raw decoder result until rendering and JSON export are done.
+5. Prefer the Constructor renderer over local reimplementation of drawing
+   semantics, especially alpha compositing and SVG fill behavior.
+6. Do not interpret a codec-internal ``TypeError`` as a signature mismatch once
+   Python signature binding has already succeeded.
+7. Keep frame extraction strict enough to avoid consuming unrelated chat text,
+   but retain the one-frame-per-line fallback for development transports.
+8. Self-test through the real Constructor encoder, decoder, and renderer when
+   those helpers are available.
+
+Technical-debt map
+------------------
+The file is divided into maintenance zones marked by banner comments:
+
+* Protocol constants and API-name registries.
+* Constructor discovery, import, inspection, and ranking.
+* Safe invocation of version-dependent APIs.
+* Decoded result normalization without loss of scene context.
+* Input/frame parsing and protocol detection.
+* Best-effort editable JSON recovery.
+* Command diagnostics and integrated round-trip testing.
+* Command-line orchestration and user-facing error boundaries.
+
+If a future Constructor changes, start by updating the relevant API-name
+registry and the feature signature.  Add a new special case only when capability
+probing cannot express the change.  This keeps protocol-specific debt near the
+boundary instead of spreading it through the rendering path.
+
+Known limitations
+-----------------
+``--dump-json`` can only recover information that survived transport or remains
+available in the Constructor's decoded scene.  Original SVG authoring metadata,
+layer names, editor-specific attributes, and pre-optimization grouping may not
+be reconstructable.  Rendering can still be exact even when the editable JSON
+is necessarily approximate.
+
+Deployment
+----------
+Keep this file beside ``MCoreIMG-Constructor.py`` or
+``MCoreIMG-SVG-Constructor.py``.  A specific Constructor may be selected with:
+
+    python MCoreIMG-Reconstructor.py image.mci --core /path/to/Constructor.py
+
+Use ``--show-core`` to inspect which APIs were selected and ``--self-test`` to
+exercise the Constructor -> transport -> decoder -> renderer round trip.
 """
 
+# =============================================================================
+# Standard-library imports
+# =============================================================================
+# The adapter intentionally avoids third-party dependencies other than Pillow,
+# which is supplied indirectly by the Constructor renderer.
 import argparse
 import importlib.util
 import inspect
@@ -40,13 +141,23 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence
 
-RECONSTRUCTOR_BUILD = "2026.08.02-v5.1-localspace-hybrid-sync"
+# =============================================================================
+# Protocol defaults and compatibility registries
+# =============================================================================
+# Values in this section describe the adapter's expectations and discovery
+# vocabulary.  The matching Constructor remains authoritative at runtime.
+# This build identifier is informational; transport compatibility comes from
+# PROTOCOL_VERSION on the Constructor and in the frame header.
+RECONSTRUCTOR_BUILD = "2026.08.02-v5.1-localspace-hybrid-sync-documented"
 PREFERRED_PROTOCOL_VERSION = 5
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 FRAME_MAGIC = "MCI"
 DEFAULT_FRAME_HEADER_LEN = 15
 DEFAULT_MESSAGE_LEN = 150
 
+# Preferred names are ordered newest/current first.  Broad glob discovery below
+# still finds renamed development files, so adding a name here is an optimization
+# and ranking hint rather than a hard requirement.
 PREFERRED_CORE_FILENAMES = (
     "MCoreIMG-SVG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py",
     "MCoreIMG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py",
@@ -65,6 +176,8 @@ CORE_GLOB_PATTERNS = (
     "*MCoreIMG*Constructor*.py",
 )
 
+# Callable-name registries translate historical public API names into one
+# normalized capability.  Put current canonical names first and aliases later.
 DECODER_NAMES = (
     "decode_frames",
     "decode_transport_frames",
@@ -109,6 +222,8 @@ ENCODER_NAMES = (
     "encode_transport",
     "encode_frames",
 )
+# Owners are objects/classes on the Constructor module that may carry codec or
+# renderer methods.  Avoid adding names that require configuration to construct.
 OWNER_NAMES = (
     "codec",
     "transport_codec",
@@ -122,6 +237,8 @@ OWNER_NAMES = (
     "Renderer",
     "Reconstructor",
 )
+# Object-layout registries support loss-minimizing inspection of decoder return
+# values.  They do not define the protocol's actual scene model.
 COMMAND_ATTRS = (
     "commands",
     "draw_commands",
@@ -146,31 +263,66 @@ CHILD_ATTRS = (
 )
 
 
+# =============================================================================
+# Normalized compatibility data model
+# =============================================================================
+# These small wrappers prevent dynamic inspection details from leaking into the
+# rest of the reconstruction pipeline.
 class ReconstructorError(RuntimeError):
+    """Raised for expected user-facing reconstruction failures.
+
+    The CLI catches this exception and prints a concise error without a Python
+    traceback.  Unexpected programming errors are intentionally not converted
+    here, because hiding them would make codec regressions harder to diagnose.
+    """
     pass
 
 
 @dataclass
 class CallableRef:
+    """A discovered callable together with the object that owns it.
+
+    Constructor APIs may live on the imported module, a singleton such as
+    ``codec``, or an instantiated no-argument compatibility class.  Retaining
+    the owner lets diagnostics report a useful qualified label.
+    """
+    # Object on which the callable was discovered: module, singleton, class,
+    # or a safely instantiated no-argument compatibility object.
     owner: Any
+    # Attribute name used for diagnostics and semantic hints.
     name: str
+    # Bound or unbound callable that will actually be invoked.
     func: Callable[..., Any]
 
     @property
     def label(self) -> str:
+        """Return a human-readable ``Owner.function`` API label."""
         owner_name = getattr(self.owner, "__name__", type(self.owner).__name__)
         return f"{owner_name}.{self.name}"
 
 
 @dataclass
 class CoreInfo:
+    """Inspected capabilities and version metadata for one Constructor core.
+
+    This is the compatibility boundary between dynamic module inspection and
+    the rest of the reconstructor.  Downstream code should depend on these
+    normalized fields rather than repeatedly probing the module.
+    """
+    # Imported Constructor module and the exact source file that produced it.
     module: ModuleType
     path: Path
+
+    # Transport protocol is the hard compatibility boundary.  Source/application
+    # versions are informational and used for export/ranking only.
     protocol: int
     source_version: int
     build: str
     feature_signature: str
     constructor_version: tuple[int, int]
+
+    # Normalized capabilities.  Some cores decode and render separately, while
+    # others expose a high-level frame-to-image operation.
     decoder: Optional[CallableRef]
     renderer: Optional[CallableRef]
     high_level_renderer: Optional[CallableRef]
@@ -180,15 +332,38 @@ class CoreInfo:
 
 @dataclass
 class DecodedAsset:
+    """Loss-minimizing wrapper around any Constructor decoder result.
+
+    ``raw`` always retains the exact object returned by the Constructor.
+    ``commands`` is only a convenience view for diagnostics and older renderers.
+    ``document`` and ``metadata`` expose common scene-level structures without
+    requiring every caller to understand every historical return shape.
+    """
+    # Exact decoder/loader result.  Never replace this with ``commands`` because
+    # modern protocols may keep palettes and group-reference tables here.
     raw: Any
+    # Best-effort flat command view used by diagnostics and legacy renderers.
     commands: list[Any]
+    # Common scene/document view when one can be identified without mutation.
     document: Any = None
+    # Optional header/palette/statistics context exposed by the Constructor.
     metadata: Any = None
+    # Original verified transport frames, retained for direct frame renderers.
     frames: Optional[list[str]] = None
+    # Human-readable input description printed by the CLI.
     source_description: str = ""
 
 
+# =============================================================================
+# Transport header primitives
+# =============================================================================
 def decode_base62(text: str) -> int:
+    """Decode the protocol's big-endian Base62 integer representation.
+
+    Frame header fields use the alphabet in ``BASE62``.  This helper is kept
+    intentionally strict so malformed headers fail before core discovery or
+    decoder invocation can produce misleading compatibility errors.
+    """
     value = 0
     if not text:
         raise ReconstructorError("Cannot decode an empty Base62 value.")
@@ -200,6 +375,12 @@ def decode_base62(text: str) -> int:
 
 
 def frame_protocol_version(frame: str) -> int:
+    """Read the one-character protocol version from an MCI frame.
+
+    The transport header is authoritative for selecting a Constructor core.
+    Filename and build-string heuristics are used only to rank cores that have
+    already declared the required protocol.
+    """
     frame = frame.strip()
     if len(frame) < 4 or not frame.startswith(FRAME_MAGIC):
         raise ReconstructorError("Cannot determine protocol from malformed MCI frame.")
@@ -207,6 +388,12 @@ def frame_protocol_version(frame: str) -> int:
 
 
 def _unique_paths(paths: Iterable[Path]) -> list[Path]:
+    """Normalize paths and remove duplicates while preserving search order.
+
+    ``resolve`` is preferred so the same file reached through a symlink or
+    relative path is not imported repeatedly.  ``absolute`` is the fallback for
+    unusual paths that cannot currently be resolved.
+    """
     seen: set[Path] = set()
     result: list[Path] = []
     for path in paths:
@@ -220,9 +407,20 @@ def _unique_paths(paths: Iterable[Path]) -> list[Path]:
     return result
 
 
+# =============================================================================
+# Constructor discovery and capability inspection
+# =============================================================================
+# Keep protocol/version-specific filename and API knowledge near this boundary.
+# Downstream decoding and rendering should work with normalized CoreInfo data.
 def _candidate_core_paths(explicit: Optional[str]) -> list[Path]:
     # --core is an explicit compatibility override and must not silently lose
     # to another versioned Constructor found in the same directory.
+    """Build the ordered set of Constructor files worth inspecting.
+
+    An explicit ``--core`` path is exclusive by design.  Automatic discovery
+    searches the reconstructor directory and current working directory, first
+    by preferred canonical names and then by broad versioned filename patterns.
+    """
     if explicit:
         return _unique_paths((Path(explicit),))
 
@@ -243,6 +441,13 @@ def _candidate_core_paths(explicit: Optional[str]) -> list[Path]:
 
 
 def _import_core(path: Path) -> ModuleType:
+    """Import a Constructor source file as a uniquely named Python module.
+
+    The module is inserted into ``sys.modules`` before execution because
+    dataclasses and annotation machinery may consult that registry while the
+    Constructor defines its classes.  Failed imports are removed to avoid
+    leaving a partially initialized module behind.
+    """
     module_name = f"_mcoreimg_constructor_{abs(hash(path.resolve()))}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
@@ -258,6 +463,13 @@ def _import_core(path: Path) -> ModuleType:
 
 
 def _constructor_version(module: ModuleType, path: Path) -> tuple[int, int]:
+    """Infer a display/ranking version from constants, build text, and filename.
+
+    ``PROTOCOL_VERSION`` is a fallback, not necessarily the application version.
+    Version inference never overrides the protocol compatibility check; it only
+    helps choose the newest implementation among cores declaring the same
+    transport protocol.
+    """
     explicit_names = (
         "CONSTRUCTOR_VERSION",
         "APP_VERSION",
@@ -286,6 +498,12 @@ def _constructor_version(module: ModuleType, path: Path) -> tuple[int, int]:
 
 
 def _can_construct_without_arguments(cls: type[Any]) -> bool:
+    """Return whether a class can be instantiated safely with no arguments.
+
+    Capability discovery may inspect API holder classes, but it must not guess
+    constructor dependencies or fabricate configuration objects.  Classes with
+    required parameters remain inspectable as class objects only.
+    """
     try:
         signature = inspect.signature(cls)
     except (TypeError, ValueError):
@@ -299,6 +517,12 @@ def _can_construct_without_arguments(cls: type[Any]) -> bool:
 
 
 def _owners(module: ModuleType) -> list[Any]:
+    """Enumerate objects that may expose Constructor compatibility APIs.
+
+    The module itself is always first.  Known singleton/class names are then
+    added once each.  No-argument classes are instantiated when possible so
+    ordinary instance methods become callable.
+    """
     owners: list[Any] = [module]
     seen: set[int] = {id(module)}
     for name in OWNER_NAMES:
@@ -318,6 +542,12 @@ def _owners(module: ModuleType) -> list[Any]:
 
 
 def _find_callable(module: ModuleType, names: Sequence[str]) -> Optional[CallableRef]:
+    """Find the first supported callable name across all candidate owners.
+
+    Registry order expresses preference: canonical current APIs should appear
+    before historical aliases.  The returned ``CallableRef`` retains enough
+    context for invocation and diagnostics.
+    """
     for owner in _owners(module):
         for name in names:
             value = getattr(owner, name, None)
@@ -327,6 +557,11 @@ def _find_callable(module: ModuleType, names: Sequence[str]) -> Optional[Callabl
 
 
 def _build_core_info(module: ModuleType, path: Path) -> CoreInfo:
+    """Inspect one imported Constructor and normalize its advertised capabilities.
+
+    A valid integer ``PROTOCOL_VERSION`` is mandatory.  Other metadata has
+    conservative defaults so older cores can still participate in discovery.
+    """
     protocol = getattr(module, "PROTOCOL_VERSION", None)
     if not isinstance(protocol, int) or not (0 <= protocol < len(BASE62)):
         raise ReconstructorError("missing or invalid integer PROTOCOL_VERSION")
@@ -346,21 +581,36 @@ def _build_core_info(module: ModuleType, path: Path) -> CoreInfo:
     )
 
 
+# The feature signature is a ranking aid for protocol 5.  A matching protocol
+# is mandatory; a perfect feature token match is preferred but not required.
 CURRENT_V5_FEATURES = frozenset({
     "PROTO5", "LOCALSPACE", "HYBRID", "PRIMITIVES", "GROUPCOPY", "ALPHA", "10MSG",
 })
 
 
 def _feature_tokens(info: CoreInfo) -> set[str]:
+    """Split a pipe-delimited feature signature into normalized tokens."""
     return {token.strip().upper() for token in info.feature_signature.split("|") if token.strip()}
 
 
 def _current_feature_score(info: CoreInfo) -> int:
+    """Count how many verified current-protocol capabilities a core advertises.
+
+    This score distinguishes the current v5.1 local-space hybrid implementation
+    from older protocol-5 experiments without rejecting those experiments
+    outright when they are the only matching decoder available.
+    """
     tokens = _feature_tokens(info)
     return len(CURRENT_V5_FEATURES.intersection(tokens))
 
 
 def _core_rank(info: CoreInfo, order: int) -> tuple[int, int, int, int, int]:
+    """Return the deterministic preference tuple used for automatic core selection.
+
+    Protocol dominates only when no required protocol was supplied.  Within a
+    protocol, current feature coverage, inferred Constructor version, canonical
+    filename, and modification time break ties in that order.
+    """
     major, minor = info.constructor_version
     canonical_bonus = int(info.path.name in PREFERRED_CORE_FILENAMES)
     try:
@@ -380,6 +630,13 @@ def load_constructor_core(
     explicit: Optional[str] = None,
     required_protocol: Optional[int] = None,
 ) -> CoreInfo:
+    """Discover, validate, rank, and return the best Constructor core.
+
+    Import failures and compatibility rejections are accumulated so the final
+    error explains every candidate that was considered.  A core is accepted
+    only when it can decode or directly render frames and can ultimately return
+    a Pillow-compatible image.
+    """
     failures: list[str] = []
     accepted: list[tuple[tuple[int, int, int, int, int], CoreInfo]] = []
 
@@ -419,7 +676,7 @@ def load_constructor_core(
     target = f"protocol {required_protocol}" if required_protocol is not None else "the newest compatible protocol"
     message = (
         f"A compatible MCoreIMG Constructor core for {target} was not found.\n\n"
-        "Place this reconstructor beside the v4.3 constructor, or pass:\n"
+        "Place this reconstructor beside the matching current constructor, or pass:\n"
         "  --core /path/to/MCoreIMG-Constructor.py\n\n"
         f"Searched:\n{searched}"
     )
@@ -428,7 +685,15 @@ def load_constructor_core(
     raise ReconstructorError(message)
 
 
+# =============================================================================
+# Safe invocation of version-dependent Constructor APIs
+# =============================================================================
 def _signature_accepts(func: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[bool]:
+    """Check whether Python can bind one argument variant to a callable.
+
+    ``None`` means the callable does not expose a reliable inspectable
+    signature, common with some extension or dynamically generated functions.
+    """
     try:
         inspect.signature(func).bind(*args, **kwargs)
     except (TypeError, ValueError):
@@ -441,6 +706,13 @@ def _call_variants(
     variants: Sequence[tuple[tuple[Any, ...], dict[str, Any]]],
     purpose: str,
 ) -> Any:
+    """Invoke a version-dependent API using a controlled list of call shapes.
+
+    Signature binding is used whenever possible.  Once binding succeeds, a
+    ``TypeError`` is considered an error inside the Constructor and is re-raised
+    instead of being mistaken for another argument mismatch.  This distinction
+    prevents genuine codec bugs from being silently hidden by fallback calls.
+    """
     mismatch_errors: list[str] = []
     for args, kwargs in variants:
         accepts = _signature_accepts(ref.func, args, kwargs)
@@ -461,11 +733,27 @@ def _call_variants(
     raise ReconstructorError(f"Could not invoke {ref.label} for {purpose}.{detail}")
 
 
+# =============================================================================
+# Decoder/renderer result normalization
+# =============================================================================
+# Constructor generations return several shapes.  Normalize useful views while
+# retaining the original object to avoid losing modern scene-level state.
 def _is_image(value: Any) -> bool:
+    """Recognize the small Pillow interface required by this program.
+
+    Duck typing avoids importing a particular Pillow class and also supports
+    compatible image wrappers returned by future renderers.
+    """
     return hasattr(value, "save") and hasattr(value, "size") and hasattr(value, "mode")
 
 
 def _extract_image(value: Any) -> Any:
+    """Search common wrapper shapes for a Pillow-compatible image object.
+
+    Renderers historically returned images directly, in mappings, in tuples, or
+    as attributes on result objects.  Extraction is recursive but deliberately
+    limited to known image-bearing positions.
+    """
     if _is_image(value):
         return value
     if isinstance(value, Mapping):
@@ -486,6 +774,7 @@ def _extract_image(value: Any) -> Any:
 
 
 def _as_sequence(value: Any) -> Optional[list[Any]]:
+    """Convert non-text sequence-like values into a mutable list view."""
     if isinstance(value, list):
         return value
     if isinstance(value, tuple):
@@ -496,6 +785,13 @@ def _as_sequence(value: Any) -> Optional[list[Any]]:
 
 
 def _commands_from_object(value: Any, seen: Optional[set[int]] = None) -> list[Any]:
+    """Recover a diagnostic/render command list from an arbitrary scene object.
+
+    The search understands common mapping keys, document methods, attributes,
+    and nested wrappers.  It is cycle-safe.  The result is a convenience view;
+    callers must retain the original scene because flattening may omit group,
+    palette, or reference-table context required by modern protocols.
+    """
     if value is None:
         return []
     if seen is None:
@@ -550,6 +846,7 @@ def _commands_from_object(value: Any, seen: Optional[set[int]] = None) -> list[A
 
 
 def _document_from_object(value: Any) -> Any:
+    """Identify the most likely document/scene object inside a decoder result."""
     if value is None:
         return None
     if isinstance(value, Mapping):
@@ -568,6 +865,7 @@ def _document_from_object(value: Any) -> Any:
 
 
 def _metadata_from_object(value: Any) -> Any:
+    """Extract optional metadata, statistics, header, or palette context."""
     if isinstance(value, Mapping):
         for key in ("metadata", "meta", "stats", "header", "palette"):
             if key in value:
@@ -587,6 +885,13 @@ def _normalize_asset(
 ) -> DecodedAsset:
     # Tuples commonly mean (commands, palette/stats/metadata).  Do not treat
     # the tuple itself as two drawable commands.
+    """Wrap a decoder/source-loader result without discarding its original shape.
+
+    Tuples need special handling because ``(commands, metadata)`` must not be
+    mistaken for two drawable commands.  The first item exposing a useful
+    command view is selected while the complete tuple remains available in
+    ``raw`` for scene-aware renderers.
+    """
     if isinstance(raw, tuple):
         document = None
         commands: list[Any] = []
@@ -611,7 +916,16 @@ def _normalize_asset(
     )
 
 
+# =============================================================================
+# Authoritative decode and render dispatch
+# =============================================================================
 def decode_with_core(core: CoreInfo, frames: Sequence[str]) -> DecodedAsset:
+    """Decode transport frames through the selected Constructor compatibility API.
+
+    Both list and newline-delimited text forms are attempted because historical
+    decoders accepted different containers.  A direct-render-only core skips
+    decoding and carries the frames forward for the high-level renderer.
+    """
     if core.decoder is None:
         # A high-level renderer may decode directly; preserve frames as the raw
         # object so rendering can still proceed.
@@ -645,10 +959,18 @@ def decode_with_core(core: CoreInfo, frames: Sequence[str]) -> DecodedAsset:
 
 
 def _render_variants(core: CoreInfo, asset: DecodedAsset) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    """Build semantically ordered renderer argument variants for one decoded asset.
+
+    Parameter and function names are used only as hints.  Scene/document
+    renderers receive the preserved scene first; command renderers receive the
+    extracted command list first; ambiguous renderers receive the raw decoder
+    result first.
+    """
     variants: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     seen: set[int] = set()
 
     def add_positional(value: Any) -> None:
+        """Append one unique non-null positional render candidate."""
         if value is None or id(value) in seen:
             return
         seen.add(id(value))
@@ -699,6 +1021,13 @@ def _render_variants(core: CoreInfo, asset: DecodedAsset) -> list[tuple[tuple[An
 
 
 def render_with_core(core: CoreInfo, asset: DecodedAsset) -> Any:
+    """Render a decoded asset with the Constructor's authoritative Pillow path.
+
+    A direct frame renderer is preferred when available because it can preserve
+    private decoder context internally.  Otherwise the normalized renderer is
+    called with ordered scene/document/command variants and its result is
+    unwrapped to a Pillow-compatible image.
+    """
     if core.high_level_renderer is not None and asset.frames:
         frames = list(asset.frames)
         text = "\n".join(frames)
@@ -729,7 +1058,15 @@ def render_with_core(core: CoreInfo, asset: DecodedAsset) -> Any:
     return image
 
 
+# =============================================================================
+# Input selection, frame extraction, and protocol detection
+# =============================================================================
 def choose_input_file() -> Optional[Path]:
+    """Open a Tk file chooser when the CLI input path is omitted.
+
+    Tkinter remains optional for headless/explicit-path use.  The hidden root is
+    destroyed immediately after selection to avoid leaving a background window.
+    """
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -756,6 +1093,12 @@ def choose_input_file() -> Optional[Path]:
 
 
 def _frame_length_at(text: str, start: int) -> Optional[int]:
+    """Calculate a complete frame length from the current 15-character header.
+
+    Returning ``None`` means the text at ``start`` is not safely parseable as a
+    current frame.  Payload and total-length bounds prevent arbitrary chat text
+    beginning with ``MCI`` from being consumed as transport data.
+    """
     if text[start:start + 3] != FRAME_MAGIC:
         return None
     if len(text) - start < DEFAULT_FRAME_HEADER_LEN:
@@ -772,6 +1115,13 @@ def _frame_length_at(text: str, start: int) -> Optional[int]:
 
 
 def extract_frames(text: str) -> list[str]:
+    """Extract unique complete MCI frames from exports or copied chat transcripts.
+
+    The primary parser uses the payload-length header field and printable-ASCII
+    constraints.  A one-frame-per-line fallback supports development transports
+    whose length field moved temporarily.  Mixed protocol versions are rejected
+    before core selection because they cannot form one coherent image stream.
+    """
     frames: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -817,6 +1167,11 @@ def extract_frames(text: str) -> list[str]:
 
 
 def read_transport_frames(path: Path) -> list[str]:
+    """Read a transport file and extract its MCI frames.
+
+    ASCII is expected for transport, with UTF-8 fallback so copied text files
+    containing harmless surrounding Unicode remain usable.
+    """
     try:
         text = path.read_text(encoding="ascii")
     except UnicodeDecodeError:
@@ -825,11 +1180,18 @@ def read_transport_frames(path: Path) -> list[str]:
 
 
 def is_editable_json(path: Path) -> bool:
+    """Return whether a path should be treated as editable MCoreIMG JSON."""
     suffixes = [suffix.lower() for suffix in path.suffixes]
     return suffixes[-2:] == [".mci", ".json"] or path.suffix.lower() == ".json"
 
 
 def inspect_source_protocol(path: Path) -> Optional[int]:
+    """Read only enough source JSON to determine its requested protocol.
+
+    Source files may omit ``protocol_version``; in that case automatic discovery
+    selects the newest compatible core.  Present values are validated against
+    the single Base62 protocol-version field.
+    """
     if not is_editable_json(path):
         return None
     try:
@@ -849,6 +1211,12 @@ def inspect_source_protocol(path: Path) -> Optional[int]:
 
 
 def prepare_input(path: Path) -> tuple[Optional[list[str]], Optional[int], str]:
+    """Classify an input and perform protocol detection before core discovery.
+
+    Transport inputs are parsed once here so the same verified frame list can
+    be passed into decoding later.  Source/SVG inputs are deferred to the
+    Constructor loader.
+    """
     if is_editable_json(path):
         return None, inspect_source_protocol(path), "editable source"
     if path.suffix.lower() in {".svg", ".svgz"}:
@@ -858,6 +1226,7 @@ def prepare_input(path: Path) -> tuple[Optional[list[str]], Optional[int], str]:
 
 
 def load_source_with_core(core: CoreInfo, path: Path) -> DecodedAsset:
+    """Load editable JSON or SVG through the Constructor's source API."""
     if core.source_loader is None:
         raise ReconstructorError("The selected Constructor cannot load SVG/source files.")
     raw = _call_variants(
@@ -879,6 +1248,12 @@ def load_asset(
     input_path: Path,
     prepared_frames: Optional[Sequence[str]],
 ) -> DecodedAsset:
+    """Load either a source document or a framed transport into ``DecodedAsset``.
+
+    The message-count check uses the selected Constructor's own ``MAX_MESSAGES``
+    value, preserving compatibility if the envelope changes in a future
+    protocol.
+    """
     if is_editable_json(input_path) or input_path.suffix.lower() in {".svg", ".svgz"}:
         return load_source_with_core(core, input_path)
 
@@ -891,7 +1266,17 @@ def load_asset(
     return decode_with_core(core, frames)
 
 
+# =============================================================================
+# Best-effort editable JSON recovery
+# =============================================================================
+# Rendering can be lossless even when authoring metadata cannot be recovered.
 def _jsonify(value: Any, seen: Optional[set[int]] = None) -> Any:
+    """Convert arbitrary Constructor objects into JSON-safe diagnostic data.
+
+    Dataclasses, mappings, containers, ``to_json`` methods, and public instance
+    attributes are supported.  Cycle detection produces an explicit marker
+    rather than recursing forever through parent/back-reference relationships.
+    """
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if seen is None:
@@ -923,6 +1308,7 @@ def _jsonify(value: Any, seen: Optional[set[int]] = None) -> Any:
 
 
 def command_to_json(command: Any) -> dict[str, Any]:
+    """Serialize one command-like object into a JSON mapping."""
     value = _jsonify(command)
     if isinstance(value, dict):
         return value
@@ -930,6 +1316,13 @@ def command_to_json(command: Any) -> dict[str, Any]:
 
 
 def _asset_json_payload(core: CoreInfo, asset: DecodedAsset, input_path: Path) -> dict[str, Any]:
+    """Build the highest-fidelity editable payload available from a decoded asset.
+
+    Constructor-provided ``to_json`` output wins because it may preserve local
+    groups and copy references.  Generic mappings come next.  The final fallback
+    emits canvas metadata plus the extracted command list and clearly documents
+    information that transport optimization may have made unrecoverable.
+    """
     for candidate in (asset.document, asset.raw):
         if candidate is None:
             continue
@@ -971,12 +1364,14 @@ def _asset_json_payload(core: CoreInfo, asset: DecodedAsset, input_path: Path) -
 
 
 def dump_source_json(core: CoreInfo, asset: DecodedAsset, input_path: Path, output_path: Path) -> Path:
+    """Write best-effort Constructor-compatible editable JSON to disk."""
     payload = _asset_json_payload(core, asset, input_path)
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return output_path
 
 
 def default_output_path(input_path: Path) -> Path:
+    """Create a collision-resistant timestamped PNG path beside the input."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     name = input_path.name
     stem = name[:-9] if name.lower().endswith(".mci.json") else input_path.stem
@@ -984,6 +1379,11 @@ def default_output_path(input_path: Path) -> Path:
 
 
 def open_output(path: Path) -> None:
+    """Ask the desktop to open the completed PNG without affecting success status.
+
+    Image reconstruction is already complete when this function runs, so desktop
+    integration failures are intentionally ignored.
+    """
     try:
         if sys.platform.startswith("linux"):
             subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -995,7 +1395,16 @@ def open_output(path: Path) -> None:
         pass
 
 
+# =============================================================================
+# Diagnostics and integrated compatibility testing
+# =============================================================================
 def _walk_commands(value: Any, seen: Optional[set[int]] = None, depth: int = 0) -> Iterator[tuple[int, Any]]:
+    """Yield command-like nodes from flat or hierarchical scene structures.
+
+    This traversal is for human diagnostics only.  It is cycle-safe, preserves
+    visible nesting depth, and does not attempt to reinterpret group/copy
+    semantics owned by the Constructor.
+    """
     if value is None:
         return
     if seen is None:
@@ -1037,12 +1446,14 @@ def _walk_commands(value: Any, seen: Optional[set[int]] = None, depth: int = 0) 
 
 
 def _value_attr(value: Any, name: str, default: Any = None) -> Any:
+    """Read one field uniformly from mappings and ordinary objects."""
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
 
 
 def _command_name(core: CoreInfo, command: Any) -> str:
+    """Resolve a readable command name from Constructor tables or object fields."""
     opcode = _value_attr(command, "opcode")
     for table_name in ("OP_NAMES", "PRIMITIVE_NAMES", "COMMAND_NAMES", "SHAPE_NAMES"):
         table = getattr(core.module, table_name, None)
@@ -1056,6 +1467,7 @@ def _command_name(core: CoreInfo, command: Any) -> str:
 
 
 def list_commands(core: CoreInfo, asset: DecodedAsset) -> None:
+    """Print a best-effort command tree for debugging protocol/scene output."""
     roots: Any = asset.commands if asset.commands else (asset.document or asset.raw)
     count = 0
     for count, (depth, command) in enumerate(_walk_commands(roots), start=1):
@@ -1074,6 +1486,7 @@ def list_commands(core: CoreInfo, asset: DecodedAsset) -> None:
 
 
 def _extract_frames_from_encoded(value: Any) -> Optional[list[str]]:
+    """Recover transport frame strings from common encoder return shapes."""
     if isinstance(value, str):
         try:
             return extract_frames(value)
@@ -1100,6 +1513,14 @@ def _extract_frames_from_encoded(value: Any) -> Optional[list[str]]:
 
 
 def run_self_test(core: CoreInfo) -> None:
+    """Exercise the selected Constructor through a real encode/decode/render cycle.
+
+    Constructor-native self-tests run first when exposed.  The adapter then
+    builds a sample document, chooses encoder arguments based on capability
+    hints, extracts frames, decodes them through this adapter, and verifies the
+    rendered canvas size.  Command counts are intentionally not compared because
+    hybrid optimization may legally replace or group commands.
+    """
     core_test = _find_callable(core.module, ("run_self_test", "self_test", "codec_self_test"))
     core_test_ran = False
     if core_test is not None:
@@ -1161,7 +1582,11 @@ def run_self_test(core: CoreInfo) -> None:
     )
 
 
+# =============================================================================
+# Command-line interface and process-level error boundary
+# =============================================================================
 def build_parser() -> argparse.ArgumentParser:
+    """Define the command-line interface without performing any I/O."""
     parser = argparse.ArgumentParser(
         description="Reconstruct MCoreIMG transports using the matching current Constructor codec and renderer."
     )
@@ -1178,6 +1603,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _print_core(core: CoreInfo) -> None:
+    """Print selected core metadata and compatibility API diagnostics."""
     print(f"Codec core: {core.path}")
     print(f"Constructor build: {core.build}")
     print(f"Constructor version: v{core.constructor_version[0]}.{core.constructor_version[1]}")
@@ -1206,6 +1632,12 @@ def _print_core(core: CoreInfo) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run CLI orchestration and convert expected failures into stable exit codes.
+
+    Exit code 0 means success, 1 means the interactive chooser was cancelled, 2
+    means a user-facing reconstruction/compatibility error, and 130 means the
+    operation was interrupted with Ctrl-C.
+    """
     args = build_parser().parse_args(argv)
     try:
         if args.protocol is not None and not (0 <= args.protocol < len(BASE62)):

@@ -30,14 +30,14 @@ Instead of transmitting a PNG or the original SVG document, MCoreIMG sends a com
 Current development filenames:
 
 ```text
-MCoreIMG-SVG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py
+MCoreIMG-SVG-Constructor-v5.1.py
 MCoreIMG-Reconstructor-v5.1.py
 ```
 
 Canonical repository filenames may be:
 
 ```text
-MCoreIMG-SVG-Constructor.py
+MCoreIMG-Constructor.py
 MCoreIMG-Reconstructor.py
 ```
 
@@ -127,25 +127,25 @@ Pillow is required for PNG export, RGBA compositing, authoritative rendering, an
 ### Constructor
 
 ```bash
-python MCoreIMG-SVG-Constructor.py
+python MCoreIMG-Constructor.py
 ```
 
 Versioned build:
 
 ```bash
-python MCoreIMG-SVG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py
+python MCoreIMG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py
 ```
 
 Show build information:
 
 ```bash
-python MCoreIMG-SVG-Constructor.py --version
+python MCoreIMG-Constructor.py --version
 ```
 
 Run the constructor self-test:
 
 ```bash
-python MCoreIMG-SVG-Constructor.py --self-test
+python MCoreIMG-Constructor.py --self-test
 ```
 
 ### Reconstructor
@@ -164,14 +164,14 @@ Use an exact constructor core:
 
 ```bash
 python MCoreIMG-Reconstructor.py image.mci \
-  --core ./MCoreIMG-SVG-Constructor.py
+  --core ./MCoreIMG-Constructor.py
 ```
 
 Versioned files:
 
 ```bash
 python MCoreIMG-Reconstructor-v5.1.py image.mci \
-  --core ./MCoreIMG-SVG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py
+  --core ./MCoreIMG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py
 ```
 
 When no input is supplied, the reconstructor opens a file chooser.
@@ -542,7 +542,7 @@ Example:
 
 ```json
 {
-  "format": "MCoreIMG-SVG-source",
+  "format": "MCoreIMG-source",
   "version": 5,
   "protocol_version": 5,
   "canvas": {"width": 720, "height": 480},
@@ -687,14 +687,14 @@ Syntax:
 
 ```bash
 python -m py_compile \
-  MCoreIMG-SVG-Constructor.py \
+  MCoreIMG-Constructor.py \
   MCoreIMG-Reconstructor.py
 ```
 
 Tests:
 
 ```bash
-python MCoreIMG-SVG-Constructor.py --self-test
+python MCoreIMG-Constructor.py --self-test
 python MCoreIMG-Reconstructor.py --protocol 5 --self-test
 python MCoreIMG-Reconstructor.py --show-core
 ```

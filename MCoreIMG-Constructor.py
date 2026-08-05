@@ -1,324 +1,92 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 """
-MCoreIMG Hybrid Constructor — protocol-v5 local-space SVG + old drawing branch
-===============================================================================
+MCoreIMG Constructor — SVG import, editing, preview, and export
+==============================================================
 
-This file is both the GUI Constructor and the reference encoder for MCoreIMG
-protocol version 5.  It imports a practical SVG subset, combines imported SVGs
-with compact legacy drawing primitives, previews the transport-visible result,
-and emits at most ten 150-character MeshCore messages.
+The Constructor is the authoring half of MCoreIMG.  It imports a practical SVG
+subset, lets an operator combine and edit artwork alongside compact radio
+primitives, previews the transport-visible result, and writes MeshCore frames.
 
-The comments in this build are intentionally extensive.  They are aimed at a
-future maintainer who needs to reconcile the technical debt created while the
-protocol evolved rapidly from the original vector-only branch through the
-hybrid primitive branch and finally into local-space SVG groups.
+It does **not** implement the model or the codec.  The drawing vocabulary
+lives in ``MCoreIMG-model.py``, and every bit of encoding, decoding, palette
+construction, record selection, and framing lives in
+``MCoreIMG-compression.py``.  If you are changing how images are compressed,
+you are in the wrong file.
 
+    MCoreIMG-model.py           <- opcodes, model, geometry
+    MCoreIMG-compression.py     <- bitstream codec and MeshCore framing
+    MCoreIMG-Constructor.py     <- you are here: SVG, rendering, editor GUI
+    MCoreIMG-Reconstructor.py   <- frame decoding and export
 
-MAINTAINER ORIENTATION
-----------------------
-
-The most important fact about this source file is that it contains several
-historical implementation layers.  Python resolves a global name at runtime,
-and a later ``def`` or ``class`` statement replaces an earlier object with the
-same name.  Therefore, the last definition of ``encode_commands``,
-``decode_commands``, ``encode_image``, ``CodecStats``, ``ConstructorApp``, and
-``run_self_test`` is the active implementation.
-
-That layering is deliberate for now because it allowed the branch to retain a
-working foundation while new protocol experiments were added.  It is also the
-largest remaining source of technical debt.  Do not edit the first function
-with a familiar name and assume it is live.  Search from the bottom upward or
-use ``inspect.getsource``/``__qualname__`` while debugging.
-
-Approximate source map:
-
-1. CORE VECTOR/SVG FOUNDATION
-   - Data model, matrix math, SVG parsing, path normalization, renderer,
-     original stateful point codec, Base91 framing, and the first GUI.
-   - Some of these definitions remain active helpers; some are superseded.
-
-2. HYBRID PRIMITIVE / REPEAT FOUNDATION
-   - Adds ``OP_PRIMITIVE`` and the legacy/manual shapes.
-   - Adds exact primitive-versus-vector bit-cost comparison.
-   - Adds single-command and translated contiguous-group references.
-   - Redefines several codec and geometry helpers.
-
-3. PROTOCOL-V5 LOCAL-SPACE SVG LAYER
-   - Adds ``REC_TRANSFORM_GROUP``.
-   - Normalizes a contiguous imported SVG group into a stable local box.
-   - Sends a fixed-width display box separately from the local geometry.
-   - Reuses identical local definitions for copied SVG instances.
-   - Redefines the active codec and image encoder.
-
-4. HYBRID GUI LAYER
-   - Adds multi-SVG import and the Old Drawing Mode.
-   - Adds editor-only grouping for imported SVGs.
-
-5. FINAL DIRECT-EDITING / UNDO GUI LAYER
-   - The last ``ConstructorApp`` is the class instantiated by ``main``.
-   - Adds drag-to-move, drag-to-scale, color selection, duplication, and undo.
-
-6. FINAL REGRESSION TESTS AND ENTRY POINT
-   - The last ``run_self_test`` is authoritative.
-   - ``verify_build_integrity`` guards the required feature set before startup.
-
-
-END-TO-END DATA FLOW
---------------------
-
-The normal path from source file to radio messages is:
-
-    SVG/XML or editable JSON
-        -> VectorDocument
-        -> ordered VectorCommand objects
-        -> editor/document transforms
-        -> primitive representation planning
-        -> local-space SVG group planning
-        -> palette construction (RGB565 + 4-bit alpha)
-        -> record selection and bit writing
-        -> stream CRC-32
-        -> Base91
-        -> 1..10 framed MeshCore messages, each with CRC-16
-
-The preview and PNG export intentionally decode the encoded stream when the
-image fits.  This is a major invariant: the GUI should show the result the
-Reconstructor will receive, including palette quantization, local-coordinate
-precision, alpha quantization, and command expansion.
-
-
-COORDINATE SPACES
------------------
-
-There are three coordinate spaces.  Confusing them previously caused the bug
-where a smaller displayed SVG required fewer messages.
-
-1. SVG SOURCE SPACE
-   Coordinates from the SVG's viewBox before import normalization.
-
-2. CANVAS / DISPLAY SPACE
-   The fixed 720 x 480 editor and reconstructed image space.  Generic vector
-   commands and compact primitives ultimately render here.
-
-3. LOCAL GROUP SPACE
-   A normalized integer coordinate box used only for protocol-v5 imported SVG
-   groups.  The geometry is stable when the user drags or scales the group.
-   A fixed-width transform box carries x, y, width, and height separately.
-
-The defining invariant is:
-
-    changing only a local SVG group's displayed position or displayed size
-    must not change the encoded local geometry bit count.
-
-A small Base91 length variation may still occur because byte padding and CRC
-values alter the final text representation, but the underlying geometry bits
-and frame count should remain stable.
-
-
-TRANSPORT RECORD TYPES
-----------------------
-
-Every command-stream record begins with two bits:
-
-    REC_NORMAL          regular opcode/style/geometry record
-    REC_SINGLE_REPEAT   repeat the most recent command of one opcode + dx/dy
-    REC_GROUP_REPEAT    repeat an earlier contiguous command range + dx/dy
-    REC_TRANSFORM_GROUP protocol-v5 local SVG definition or definition ref
-
-``REC_TRANSFORM_GROUP`` reuses the old reserved record value.  A transform
-record carries a display box and either:
-
-- a new local command definition, or
-- an index referring to an identical earlier local definition.
-
-Definitions are stream-local.  Their numeric index is meaningful only while
-decoding one image and must never be persisted as editor metadata.
-
-
-COMPRESSION DECISION ORDER
---------------------------
-
-Compression is not selected from fixed estimates.  The encoder simulates real
-bitstreams and chooses representations based on actual bit count in context.
-The current order is roughly:
-
-1. For every manual primitive, compare the compact primitive record with its
-   deterministic generic-vector expansion.  Keep the smaller representation.
-2. Detect contiguous editor groups eligible for local-space SVG records.
-3. Reuse an identical earlier local definition when possible.
-4. For non-local commands, test translated contiguous-group references.
-5. Otherwise compare a single-opcode repeat with a normal record.
-
-Because codec state affects cost, changing this order can change compression.
-Any reordering needs regression images, not only isolated unit tests.
-
-
-EDITOR METADATA VERSUS TRANSPORT DATA
--------------------------------------
-
-``VectorCommand.editor_group`` exists only to make imported SVGs behave as one
-object in the GUI and to identify contiguous local-space candidates.  It is
-saved in editable source JSON, but is not itself transmitted as an image
-field.  The encoder infers records from command order and group boundaries.
-
-Important group assumptions:
-
-- Commands belonging to one imported SVG should remain contiguous.
-- Layer reordering can split a group and therefore disable local-group reuse.
-- A primitive is intentionally excluded from local SVG groups.
-- Direct editing may bake the document-level transform so object manipulation
-  happens in one predictable canvas coordinate system.
-
-
-COLOR AND ALPHA
+WHAT LIVES HERE
 ---------------
 
-Colors are normalized to ``#RRGGBB`` or ``#RRGGBBAA`` strings.  Transmission
-uses RGB565 plus A4:
+1.  :class:`VectorDocument` — the editable document, its non-destructive
+    document transform, and editable-JSON serialization.
+2.  The SVG importer: path parsing, transform and style resolution, a small
+    CSS subset, ``<use>`` expansion, and shape normalization.
+3.  Rendering to Tk (interactive canvas) and to Pillow (preview and PNG).
+4.  Multi-SVG composition helpers and editor-only grouping.
+5.  The Tk GUI.
+6.  The regression suite, build-integrity guard, and command-line entry point.
 
-- 16 bits for red/green/blue (5/6/5)
-- 4 bits for alpha (0..15)
-
-The renderer uses source-over compositing in draw order.  Never pre-blend a
-transparent SVG color against white during import; doing so destroys overlap
-information.  Color chooser operations preserve the existing alpha nibble
-when only RGB is changed.
-
-
-FRAME ENVELOPE
---------------
-
-The message profile is intentionally separate from the vector codec:
-
-- maximum messages: 10
-- message length: 150 characters
-- frame header: 15 characters
-- maximum payload text: 1,350 Base91 characters
-- per-frame CRC: CRC-16 over the text chunk
-- stream CRC: CRC-32 over encoded bytes
-
-The frame header also carries protocol version, image ID, part index, total
-parts, and chunk length.  A decoder must reject mixed image IDs, duplicate or
-missing parts, invalid lengths, unsupported versions, and either CRC failure.
-
-
-ERROR-HANDLING PRINCIPLES
+RELATIONSHIP TO THE CODEC
 -------------------------
 
-``MCIError`` means valid program flow reached invalid MCoreIMG data or editor
-state.  ``SVGImportError`` adds source-import context.  ``FrameError`` means
-the text envelope is damaged or inconsistent.
+The editor speaks the same model the codec does: ``VectorCommand`` objects
+carrying a ``PaintStyle`` and an opcode-specific ``geom`` dictionary.  Those
+types are defined by the model module, which both this file and the codec
+import, so the editor and the transport can never disagree about them.
 
-Decoder limits are security and reliability boundaries, not conveniences.
-Keep maximum counts and coordinate bounds when refactoring.  A corrupt radio
-message must fail quickly rather than allocate an unbounded structure.
+``editor_group`` is the one piece of purely editorial metadata.  It lets the
+GUI move an imported SVG as a single object, and it is also the hint the
+encoder uses to propose a local-space group.  It is never transmitted directly.
 
+Preview rendering deliberately draws the *decoded* command stream whenever the
+image fits the ten-message budget, so the screen shows palette quantization,
+alpha quantization, and coordinate precision exactly as a receiver would.
 
-TESTING EXPECTATIONS
---------------------
+GUI STRUCTURE
+-------------
 
-Before distributing a modified Constructor, run:
+The GUI is three cooperating classes:
 
-    python <file>.py --version
-    python <file>.py --self-test
+``_DocumentAppBase``
+    Document lifecycle, layer list, file open/save, preview and statistics.
+``_DrawingAppBase``
+    Adds multi-SVG import, editor grouping, and Old Drawing Mode.
+``ConstructorApp``
+    Adds direct canvas editing — select, drag, scale, recolour — plus undo.
 
-The final self-test covers at least:
-
-- protocol and frame-profile constants
-- encode/decode round trips
-- alpha preservation and compositing
-- full ten-message framing and corruption rejection
-- primitive-versus-vector decisions
-- translated group-copy records
-- local-space scaling invariance
-- copied local-definition references
-- required GUI feature presence through ``verify_build_integrity``
-
-For UI work, also launch the application and manually check:
-
-- import one SVG and several SVGs
-- drag a whole imported group
-- scale with the blue handle
-- draw and color a primitive
-- undo the import and drawing action
-- preview frames and export PNG
-
-
-KNOWN TECHNICAL DEBT
---------------------
-
-1. DUPLICATE DEFINITIONS
-   The file should eventually be split into modules and each active symbol
-   should have one definition.  Until then, comments marked ``ACTIVE V5`` and
-   ``SUPERSEDED FOUNDATION`` describe which layer wins.
-
-2. GLOBAL LOCAL_GROUP_EXTENT
-   ``_encode_image_once_v5`` temporarily mutates this global to test precision
-   candidates.  The GUI is single-threaded, so it is currently safe, but this
-   is not reentrant or thread-safe.  Pass an explicit codec-options object in a
-   future cleanup.
-
-3. DICTIONARY-SHAPED GEOMETRY
-   ``VectorCommand.geom`` is flexible but weakly typed.  Dedicated dataclasses
-   or tagged immutable records would move many runtime checks to type checking.
-
-4. GUI INHERITANCE STACK
-   The final ConstructorApp subclasses an earlier ConstructorApp that already
-   subclasses the base GUI.  This preserves behavior but obscures method
-   resolution.  Collapse it after protocol work stabilizes.
-
-5. IMPORT AND PROTOCOL COUPLING
-   SVG normalization, editor grouping, and transport planning live in one file.
-   Separating importer, model, optimizer, codec, renderer, and GUI would make
-   tests smaller and protocol compatibility easier to reason about.
-
-6. GREEDY RECORD PLANNING
-   The encoder performs local comparisons and bounded group searches rather
-   than a global dynamic-programming optimum.  It is practical for the message
-   budget, but future changes should preserve deterministic runtime limits.
-
-7. RASTER PREVIEW COST
-   The GUI re-encodes and decodes frequently to preserve preview parity.  Large
-   SVGs can make dragging expensive.  A debounced preview or cached local
-   definitions would improve responsiveness without changing transport data.
-
-
-SAFE REFACTORING ORDER
-----------------------
-
-A lower-risk cleanup sequence is:
-
-1. Freeze protocol-v5 regression fixtures and expected decoded command lists.
-2. Extract pure data classes and matrix/color helpers.
-3. Extract SVG import and rendering.
-4. Extract bitstream/framing utilities.
-5. Move the active v5 encoder/decoder only; do not carry superseded functions.
-6. Replace editor inheritance layers with one GUI class.
-7. Replace mutable globals with an explicit CodecConfig.
-8. Remove the historical definitions only after all fixtures match.
-
-Do not combine a structural cleanup with a protocol-format change.  Those are
-two separate review problems and should be committed separately.
-
+These were previously three top-level definitions all named ``ConstructorApp``,
+chained together by alias assignments and resolved only by Python's
+last-definition-wins rule.  They are now named for what they do and inherit
+explicitly.  Collapsing them into a single class is still worthwhile but
+requires interactive GUI testing, so it is deliberately left as a separate
+change.
 
 Run:
-    python MCoreIMG-SVG-Constructor-v5.1-DOCUMENTED.py
+    python MCoreIMG-Constructor.py
 
-Self-test:
-    python MCoreIMG-SVG-Constructor-v5.1-DOCUMENTED.py --self-test
+Version and self-test:
+    python MCoreIMG-Constructor.py --version
+    python MCoreIMG-Constructor.py --self-test
 
 Arch Linux dependencies:
     sudo pacman -Syu python tk python-pillow
 """
 
+from __future__ import annotations
+
 import argparse
-import binascii
 import copy
 import gzip
+import importlib.util
 import json
 import math
 import re
 import subprocess
+import sys
 import tkinter as tk
 import zlib
 from dataclasses import dataclass, field
@@ -328,77 +96,206 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 from xml.etree import ElementTree as ET
 
 try:
-    from PIL import Image, ImageColor, ImageDraw, ImageTk
+    from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageTk
 except ImportError:
     Image = None
     ImageColor = None
     ImageDraw = None
+    ImageFont = None
     ImageTk = None
 
 
-# ---------------------------------------------------------------------------
-# Protocol and editor constants
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Codec import
+# ===========================================================================
+#
+# The model and the codec ship as hyphenated filenames, which are not legal
+# Python identifiers, so they are loaded by path rather than by ``import``.
+# Loading the codec pulls in the model, so only the codec is loaded here.
+# Both files are expected to sit beside this one; --compression overrides that.
 
-# Canvas dimensions are part of the current protocol profile. Generic vector
-# coordinates are validated against these bounds, while local SVG definitions
-# use their own normalized coordinate box plus a display transform.
-CANVAS_W = 720
-CANVAS_H = 480
+COMPRESSION_FILENAME = "MCoreIMG-compression.py"
+
+
+def load_compression(explicit: Optional[str] = None):
+    """Import the compression module from an explicit path or from beside us.
+
+    Kept as a function so tooling and tests can load an alternate codec build
+    without editing this file.
+    """
+    candidates = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.append(Path(__file__).resolve().parent / COMPRESSION_FILENAME)
+    candidates.append(Path.cwd() / COMPRESSION_FILENAME)
+
+    tried = []
+    for path in candidates:
+        tried.append(str(path))
+        if not path.is_file():
+            continue
+
+        # Reuse an already-imported codec rather than creating a second module
+        # object. Two copies would define two distinct VectorCommand classes,
+        # and objects decoded by one would not be recognised by the other. The
+        # Reconstructor imports the codec before importing this file, so this
+        # path is taken in normal use.
+        existing = sys.modules.get("mcoreimg_compression")
+        if existing is not None:
+            existing_file = getattr(existing, "__file__", None)
+            if existing_file and Path(existing_file).resolve() == path.resolve():
+                return existing
+
+        spec = importlib.util.spec_from_file_location("mcoreimg_compression", path)
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["mcoreimg_compression"] = module
+        spec.loader.exec_module(module)
+        return module
+
+    searched = "\n".join(f"  - {item}" for item in tried)
+    raise SystemExit(
+        f"Cannot find {COMPRESSION_FILENAME}.\n\n"
+        f"Place it beside this file, or pass --compression /path/to/{COMPRESSION_FILENAME}.\n\n"
+        f"Searched:\n{searched}"
+    )
+
+
+def _early_compression_arg(argv: Optional[Sequence[str]] = None) -> Optional[str]:
+    """Read --compression before argparse runs.
+
+    The codec must be imported at module import time because it defines the
+    model classes used by everything below, which is earlier than argparse can
+    run. This scan keeps the flag usable without duplicating the parser.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    for index, item in enumerate(args):
+        if item == "--compression" and index + 1 < len(args):
+            return args[index + 1]
+        if item.startswith("--compression="):
+            return item.split("=", 1)[1]
+    return None
+
+
+mci = load_compression(_early_compression_arg())
+model = mci.model
+
+# Names used throughout this file. Everything here is defined by the codec so
+# that the editor and the transport can never disagree about the model.
+MCIError = mci.MCIError
+FrameError = mci.FrameError
+PaintStyle = mci.PaintStyle
+VectorCommand = mci.VectorCommand
+Matrix = mci.Matrix
+IDENTITY = mci.IDENTITY
+
+PROTOCOL_VERSION = mci.PROTOCOL_VERSION
+CANVAS_W = mci.CANVAS_W
+CANVAS_H = mci.CANVAS_H
+MAX_MESSAGES = mci.MAX_MESSAGES
+MESSAGE_LEN = mci.MESSAGE_LEN
+FRAME_HEADER_LEN = mci.FRAME_HEADER_LEN
+FRAME_PAYLOAD_LEN = mci.FRAME_PAYLOAD_LEN
+MAX_PAYLOAD_CHARS = mci.MAX_PAYLOAD_CHARS
+MAX_COMMANDS = mci.MAX_COMMANDS
+MAX_PALETTE = mci.MAX_PALETTE
+
+OP_RECT = mci.OP_RECT
+OP_ELLIPSE = mci.OP_ELLIPSE
+OP_LINE = mci.OP_LINE
+OP_POLYLINE = mci.OP_POLYLINE
+OP_POLYGON = mci.OP_POLYGON
+OP_PATH = mci.OP_PATH
+OP_PRIMITIVE = mci.OP_PRIMITIVE
+OP_NAMES = mci.OP_NAMES
+
+SEG_M = mci.SEG_M
+SEG_L = mci.SEG_L
+SEG_Q = mci.SEG_Q
+SEG_C = mci.SEG_C
+SEG_Z = mci.SEG_Z
+SEG_NAMES = mci.SEG_NAMES
+
+PRIM_TEXT = mci.PRIM_TEXT
+PRIM_TRIANGLE_OUTLINE = mci.PRIM_TRIANGLE_OUTLINE
+PRIM_TRIANGLE_FILL = mci.PRIM_TRIANGLE_FILL
+PRIM_ARROW = mci.PRIM_ARROW
+PRIM_STAR = mci.PRIM_STAR
+PRIM_ARC = mci.PRIM_ARC
+PRIM_YAGI = mci.PRIM_YAGI
+PRIM_DISH = mci.PRIM_DISH
+PRIM_RADIO = mci.PRIM_RADIO
+PRIM_RADIO_WAVES = mci.PRIM_RADIO_WAVES
+PRIM_MOON = mci.PRIM_MOON
+PRIM_DOUBLE_BOX = mci.PRIM_DOUBLE_BOX
+PRIMITIVE_NAMES = mci.PRIMITIVE_NAMES
+PRIMITIVE_BY_NAME = mci.PRIMITIVE_BY_NAME
+TEXT_ALPHABET = mci.TEXT_ALPHABET
+MAX_TEXT_LEN = mci.MAX_TEXT_LEN
+MOON_CRATER_POINTS = mci.MOON_CRATER_POINTS
+primitive_to_vectors = mci.primitive_to_vectors
+primitive_kind = mci.primitive_kind
+primitive_anchor = mci.primitive_anchor
+clean_primitive_text = mci.clean_primitive_text
+
+mat_mul = mci.mat_mul
+mat_translate = mci.mat_translate
+mat_scale = mci.mat_scale
+mat_rotate = mci.mat_rotate
+apply_mat = mci.apply_mat
+is_axis_aligned = mci.is_axis_aligned
+clamp_int = mci.clamp_int
+normalize_hex = mci.normalize_hex
+color_to_rgba = mci.color_to_rgba
+rgba_to_hex = mci.rgba_to_hex
+cubic_point = mci.cubic_point
+quad_point = mci.quad_point
+flatten_path = mci.flatten_path
+command_points = mci.command_points
+commands_bbox = mci.commands_bbox
+transform_command = mci.transform_command
+translate_command = mci.translate_command
+quantize_command = mci.quantize_command
+validate_command = mci.validate_command
+geom_translation = mci.geom_translation
+
+build_palette = mci.build_palette
+quantize_palette_color = mci.quantize_palette_color
+rgb565 = mci.rgb565
+alpha4 = mci.alpha4
+from_rgb565 = mci.from_rgb565
+from_rgb565_a4 = mci.from_rgb565_a4
+
+BASE62 = mci.BASE62
+BASE91 = mci.BASE91
+BASE91_INDEX = mci.BASE91_INDEX
+
+CodecStats = mci.CodecStats
+EncodedImage = mci.EncodedImage
+encode_image = mci.encode_image
+decode_frames = mci.decode_frames
+encode_commands = mci.encode_commands
+decode_commands = mci.decode_commands
+
+
+# ===========================================================================
+# Editor constants
+# ===========================================================================
 
 # BACKGROUND affects preview/export compositing but is not transmitted as an
-# explicit command. A future configurable background would need either a
-# protocol field or an agreed Reconstructor default.
+# explicit command. A configurable background would need either a protocol
+# field or an agreed Reconstructor default.
 BACKGROUND = "#FFFFFF"
 DEFAULT_MARGIN = 8
 
-# PROTOCOL_VERSION is written into both the bitstream and every frame header.
-# SOURCE_VERSION belongs only to editable JSON and may evolve independently.
-PROTOCOL_VERSION = 5
+# The editable JSON format is an editor concern and may evolve independently
+# of the transport protocol.
 SOURCE_FORMAT = "MCoreIMG-SVG-source"
 SOURCE_VERSION = 5
-CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-DOCUMENTED-LOCALSPACE-HYBRID-10MSG"
+
+CONSTRUCTOR_BUILD = "2026.08.05-svg-v5.2-MODULAR-LOCALSPACE-HYBRID-10MSG"
 FEATURE_SIGNATURE = "PROTO5|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG"
-
-# MeshCore transport profile. Keep the arithmetic expressed in one place so
-# GUI counters, encoder limits, and decoder validation cannot drift apart.
-MAX_MESSAGES = 10
-MESSAGE_LEN = 150
-FRAME_HEADER_LEN = 15
-FRAME_PAYLOAD_LEN = MESSAGE_LEN - FRAME_HEADER_LEN
-MAX_PAYLOAD_CHARS = MAX_MESSAGES * FRAME_PAYLOAD_LEN
-FRAME_MAGIC = "MCI"
-
-# Defensive decoder limits. These cap allocation and malformed-count loops.
-MAX_COMMANDS = 2048
-MAX_PALETTE = 32
-
-BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-BASE91 = "".join(chr(c) for c in range(33, 127) if chr(c) not in {'"', "'", "\\"})
-BASE91_INDEX = {ch: i for i, ch in enumerate(BASE91)}
-assert len(BASE91) == 91
-
-OP_RECT = 0
-OP_ELLIPSE = 1
-OP_LINE = 2
-OP_POLYLINE = 3
-OP_POLYGON = 4
-OP_PATH = 5
-OP_NAMES = {
-    OP_RECT: "Rectangle",
-    OP_ELLIPSE: "Ellipse",
-    OP_LINE: "Line",
-    OP_POLYLINE: "Polyline",
-    OP_POLYGON: "Polygon",
-    OP_PATH: "Path",
-}
-
-SEG_M = 0
-SEG_L = 1
-SEG_Q = 2
-SEG_C = 3
-SEG_Z = 4
-SEG_NAMES = {SEG_M: "M", SEG_L: "L", SEG_Q: "Q", SEG_C: "C", SEG_Z: "Z"}
 
 CSS_NAMED_FALLBACK = {
     "black": "#000000", "white": "#FFFFFF", "red": "#FF0000",
@@ -411,114 +308,18 @@ CSS_NAMED_FALLBACK = {
 }
 
 
-class MCIError(ValueError):
-    """Base exception for invalid MCoreIMG model, codec, or stream data."""
-
-    pass
-
+# ==========================================================================
+# Editor errors
+# ==========================================================================
 
 class SVGImportError(MCIError):
     """Raised when SVG/XML cannot be normalized into the supported model."""
 
     pass
 
-
-class FrameError(MCIError):
-    """Raised for damaged, incomplete, mixed, or inconsistent text frames."""
-
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Vector model
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PaintStyle:
-    """Transport-visible paint state shared by generic and primitive commands.
-
-    ``fill`` and ``stroke`` are normalized RGB/RGBA strings or ``None``.
-    ``stroke_width`` is a canvas-space width before final quantization.
-    ``fill_rule`` is retained because compound SVG paths can require even-odd
-    filling to preserve holes.
-    """
-
-    fill: Optional[str] = "#000000"
-    stroke: Optional[str] = None
-    stroke_width: float = 1.0
-    fill_rule: str = "nonzero"
-
-    def normalized(self) -> "PaintStyle":
-        return PaintStyle(
-            normalize_hex(self.fill) if self.fill else None,
-            normalize_hex(self.stroke) if self.stroke else None,
-            max(0.0, float(self.stroke_width)),
-            "evenodd" if str(self.fill_rule).lower() == "evenodd" else "nonzero",
-        )
-
-    def to_json(self) -> Dict[str, Any]:
-        return {
-            "fill": self.fill,
-            "stroke": self.stroke,
-            "stroke_width": self.stroke_width,
-            "fill_rule": self.fill_rule,
-        }
-
-    @classmethod
-    def from_json(cls, obj: Dict[str, Any]) -> "PaintStyle":
-        return cls(
-            obj.get("fill"), obj.get("stroke"), float(obj.get("stroke_width", 1.0)),
-            str(obj.get("fill_rule", "nonzero")),
-        ).normalized()
-
-
-@dataclass
-class VectorCommand:
-    """One ordered drawing operation in the editor/intermediate model.
-
-    ``geom`` is opcode-specific. ``editor_group`` is GUI/source metadata used
-    to move an imported SVG as one object and to propose local-space groups; it
-    is not directly serialized into the radio command stream.
-    """
-
-    opcode: int
-    style: PaintStyle
-    geom: Dict[str, Any]
-    label: str = ""
-    visible: bool = True
-    editor_group: Optional[int] = None
-
-    def clone(self) -> "VectorCommand":
-        return copy.deepcopy(self)
-
-    def to_json(self) -> Dict[str, Any]:
-        return {
-            "opcode": self.opcode,
-            "type": OP_NAMES.get(self.opcode, "Unknown"),
-            "style": self.style.to_json(),
-            "geom": copy.deepcopy(self.geom),
-            "label": self.label,
-            "visible": self.visible,
-            "editor_group": self.editor_group,
-        }
-
-    @classmethod
-    def from_json(cls, obj: Dict[str, Any]) -> "VectorCommand":
-        opcode = int(obj["opcode"])
-        if opcode not in OP_NAMES:
-            raise MCIError(f"Unknown vector opcode {opcode}.")
-        cmd = cls(
-            opcode,
-            PaintStyle.from_json(dict(obj.get("style", {}))),
-            copy.deepcopy(dict(obj.get("geom", {}))),
-            str(obj.get("label", "")),
-            bool(obj.get("visible", True)),
-            obj.get("editor_group"),
-        )
-        validate_command(cmd)
-        return cmd
-
+# ==========================================================================
+# Editable document
+# ==========================================================================
 
 @dataclass
 class VectorDocument:
@@ -592,73 +393,9 @@ class VectorDocument:
         )
         return doc
 
-
-@dataclass
-class CodecStats:
-    command_count: int
-    palette_count: int
-    bit_count: int
-    packed_bytes: int
-    base91_chars: int
-    frame_count: int
-    repeat_count: int
-
-    @property
-    def fits(self) -> bool:
-        return self.frame_count <= MAX_MESSAGES
-
-
-@dataclass
-class EncodedImage:
-    raw: bytes
-    payload: str
-    frames: List[str]
-    stats: CodecStats
-    image_id: str
-    palette: List[str]
-
-
-# ---------------------------------------------------------------------------
-# Affine matrices and geometry helpers
-# ---------------------------------------------------------------------------
-
-# SVG affine tuple: (a,b,c,d,e,f), x'=a*x+c*y+e, y'=b*x+d*y+f
-Matrix = Tuple[float, float, float, float, float, float]
-IDENTITY: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-
-
-def mat_mul(left: Matrix, right: Matrix) -> Matrix:
-    a1, b1, c1, d1, e1, f1 = left
-    a2, b2, c2, d2, e2, f2 = right
-    return (
-        a1*a2 + c1*b2,
-        b1*a2 + d1*b2,
-        a1*c2 + c1*d2,
-        b1*c2 + d1*d2,
-        a1*e2 + c1*f2 + e1,
-        b1*e2 + d1*f2 + f1,
-    )
-
-
-def mat_translate(x: float, y: float) -> Matrix:
-    return (1.0, 0.0, 0.0, 1.0, x, y)
-
-
-def mat_scale(x: float, y: float) -> Matrix:
-    return (x, 0.0, 0.0, y, 0.0, 0.0)
-
-
-def mat_rotate(degrees: float) -> Matrix:
-    r = math.radians(degrees)
-    c, s = math.cos(r), math.sin(r)
-    return (c, s, -s, c, 0.0, 0.0)
-
-
-def apply_mat(m: Matrix, p: Tuple[float, float]) -> Tuple[float, float]:
-    a, b, c, d, e, f = m
-    x, y = p
-    return a*x + c*y + e, b*x + d*y + f
-
+# ==========================================================================
+# SVG value parsing
+# ==========================================================================
 
 def parse_transform(text: Optional[str]) -> Matrix:
     if not text:
@@ -686,47 +423,6 @@ def parse_transform(text: Optional[str]) -> Matrix:
             continue
         result = mat_mul(result, m)
     return result
-
-
-def is_axis_aligned(m: Matrix, eps: float = 1e-9) -> bool:
-    return abs(m[1]) < eps and abs(m[2]) < eps
-
-
-def clamp_int(v: float, lo: int, hi: int) -> int:
-    return max(lo, min(hi, int(round(v))))
-
-
-def normalize_hex(value: str) -> str:
-    value = value.strip().upper()
-    if re.fullmatch(r"#[0-9A-F]{8}", value):
-        return value if not value.endswith("FF") else value[:7]
-    if re.fullmatch(r"#[0-9A-F]{6}", value):
-        return value
-    if re.fullmatch(r"#[0-9A-F]{4}", value):
-        return "#" + "".join(ch*2 for ch in value[1:])
-    if re.fullmatch(r"#[0-9A-F]{3}", value):
-        return "#" + "".join(ch*2 for ch in value[1:])
-    parsed = parse_color(value)
-    return parsed or "#000000"
-
-
-def color_to_rgba(color: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
-    if color is None:
-        return None
-    value = normalize_hex(color)
-    if re.fullmatch(r"#[0-9A-F]{6}", value):
-        return int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16), 255
-    if re.fullmatch(r"#[0-9A-F]{8}", value):
-        return int(value[1:3], 16), int(value[3:5], 16), int(value[5:7], 16), int(value[7:9], 16)
-    return None
-
-
-def rgba_to_hex(r: int, g: int, b: int, a: int = 255) -> str:
-    r = max(0, min(255, int(round(r))))
-    g = max(0, min(255, int(round(g))))
-    b = max(0, min(255, int(round(b))))
-    a = max(0, min(255, int(round(a))))
-    return f"#{r:02X}{g:02X}{b:02X}" if a >= 255 else f"#{r:02X}{g:02X}{b:02X}{a:02X}"
 
 
 def parse_color(value: Optional[str], opacity: float = 1.0) -> Optional[str]:
@@ -780,145 +476,9 @@ def parse_length(value: Optional[str], default: float = 0.0, reference: float = 
         return number * reference / 100.0
     return number * factors.get(unit, 1.0)
 
-
-def command_points(cmd: VectorCommand) -> List[Tuple[float, float]]:
-    g = cmd.geom
-    if cmd.opcode == OP_RECT:
-        x, y, w, h = g["x"], g["y"], g["w"], g["h"]
-        return [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-    if cmd.opcode == OP_ELLIPSE:
-        cx, cy, rx, ry = g["cx"], g["cy"], g["rx"], g["ry"]
-        return [(cx-rx, cy-ry), (cx+rx, cy+ry)]
-    if cmd.opcode == OP_LINE:
-        return [tuple(g["p1"]), tuple(g["p2"])]
-    if cmd.opcode in {OP_POLYLINE, OP_POLYGON}:
-        return [tuple(p) for p in g["points"]]
-    if cmd.opcode == OP_PATH:
-        # A Bezier control point is not necessarily on the visible curve.
-        # Bounding paths by raw control points can falsely report artwork as
-        # outside the canvas and can make Fit shrink it far too much.  Use the
-        # same flattened geometry that the preview/export renderer displays.
-        points: List[Tuple[float, float]] = []
-        for subpath, _closed in flatten_path(g["segments"], 24):
-            points.extend(subpath)
-        return points
-    return []
-
-
-def commands_bbox(commands: Sequence[VectorCommand]) -> Tuple[float, float, float, float]:
-    points = [p for c in commands for p in command_points(c)]
-    if not points:
-        return 0.0, 0.0, 0.0, 0.0
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    # Include half stroke width in the bounds.
-    pad = max((c.style.stroke_width/2 for c in commands if c.style.stroke), default=0.0)
-    return min(xs)-pad, min(ys)-pad, max(xs)+pad, max(ys)+pad
-
-
-def transform_command(cmd: VectorCommand, m: Matrix) -> VectorCommand:
-    out = cmd.clone()
-    a, b, c, d, _e, _f = m
-    sx = math.hypot(a, b)
-    sy = math.hypot(c, d)
-    stroke_scale = (sx + sy) / 2.0
-    out.style.stroke_width *= max(stroke_scale, 1e-9)
-    g = out.geom
-    if cmd.opcode == OP_RECT:
-        corners = command_points(cmd)
-        mapped = [apply_mat(m, p) for p in corners]
-        if is_axis_aligned(m):
-            xs, ys = [p[0] for p in mapped], [p[1] for p in mapped]
-            out.geom = {"x": min(xs), "y": min(ys), "w": max(xs)-min(xs), "h": max(ys)-min(ys)}
-        else:
-            out.opcode = OP_POLYGON
-            out.geom = {"points": mapped}
-    elif cmd.opcode == OP_ELLIPSE:
-        cx, cy, rx, ry = g["cx"], g["cy"], g["rx"], g["ry"]
-        if is_axis_aligned(m):
-            center = apply_mat(m, (cx, cy))
-            out.geom = {"cx": center[0], "cy": center[1], "rx": abs(rx*a), "ry": abs(ry*d)}
-        else:
-            k = 0.5522847498307936
-            raw = [
-                {"op": SEG_M, "points": [(cx+rx, cy)]},
-                {"op": SEG_C, "points": [(cx+rx, cy+k*ry), (cx+k*rx, cy+ry), (cx, cy+ry)]},
-                {"op": SEG_C, "points": [(cx-k*rx, cy+ry), (cx-rx, cy+k*ry), (cx-rx, cy)]},
-                {"op": SEG_C, "points": [(cx-rx, cy-k*ry), (cx-k*rx, cy-ry), (cx, cy-ry)]},
-                {"op": SEG_C, "points": [(cx+k*rx, cy-ry), (cx+rx, cy-k*ry), (cx+rx, cy)]},
-                {"op": SEG_Z, "points": []},
-            ]
-            out.opcode = OP_PATH
-            out.geom = {"segments": [{"op": s["op"], "points": [apply_mat(m, p) for p in s["points"]]} for s in raw]}
-    elif cmd.opcode == OP_LINE:
-        out.geom = {"p1": apply_mat(m, tuple(g["p1"])), "p2": apply_mat(m, tuple(g["p2"]))}
-    elif cmd.opcode in {OP_POLYLINE, OP_POLYGON}:
-        out.geom = {"points": [apply_mat(m, tuple(p)) for p in g["points"]]}
-    elif cmd.opcode == OP_PATH:
-        out.geom = {"segments": [
-            {"op": int(seg["op"]), "points": [apply_mat(m, tuple(p)) for p in seg.get("points", [])]}
-            for seg in g["segments"]
-        ]}
-    return out
-
-
-def quantize_command(cmd: VectorCommand) -> VectorCommand:
-    out = cmd.clone()
-    out.style.stroke_width = max(1, min(64, int(round(out.style.stroke_width)))) if out.style.stroke else 0
-    g = out.geom
-    def qp(p: Tuple[float, float]) -> Tuple[int, int]:
-        return clamp_int(p[0], 0, CANVAS_W-1), clamp_int(p[1], 0, CANVAS_H-1)
-    if out.opcode == OP_RECT:
-        x1, y1 = qp((g["x"], g["y"]))
-        x2, y2 = qp((g["x"]+g["w"], g["y"]+g["h"]))
-        out.geom = {"x": min(x1, x2), "y": min(y1, y2), "w": max(1, abs(x2-x1)), "h": max(1, abs(y2-y1))}
-    elif out.opcode == OP_ELLIPSE:
-        cx, cy = qp((g["cx"], g["cy"]))
-        out.geom = {"cx": cx, "cy": cy, "rx": max(1, min(719, int(round(abs(g["rx"]))))), "ry": max(1, min(479, int(round(abs(g["ry"])))))}
-    elif out.opcode == OP_LINE:
-        out.geom = {"p1": qp(tuple(g["p1"])), "p2": qp(tuple(g["p2"]))}
-    elif out.opcode in {OP_POLYLINE, OP_POLYGON}:
-        out.geom = {"points": [qp(tuple(p)) for p in g["points"]]}
-    elif out.opcode == OP_PATH:
-        out.geom = {"segments": [{"op": int(s["op"]), "points": [qp(tuple(p)) for p in s.get("points", [])]} for s in g["segments"]]}
-    validate_command(out)
-    return out
-
-
-def validate_command(cmd: VectorCommand) -> None:
-    if cmd.opcode not in OP_NAMES:
-        raise MCIError(f"Invalid opcode {cmd.opcode}.")
-    style = cmd.style.normalized()
-    if style.fill is None and style.stroke is None:
-        raise MCIError("A command must have a fill or stroke.")
-    g = cmd.geom
-    if cmd.opcode == OP_RECT:
-        if float(g.get("w", 0)) <= 0 or float(g.get("h", 0)) <= 0:
-            raise MCIError("Rectangle width and height must be positive.")
-    elif cmd.opcode == OP_ELLIPSE:
-        if float(g.get("rx", 0)) <= 0 or float(g.get("ry", 0)) <= 0:
-            raise MCIError("Ellipse radii must be positive.")
-    elif cmd.opcode == OP_LINE:
-        if "p1" not in g or "p2" not in g:
-            raise MCIError("Line requires p1 and p2.")
-    elif cmd.opcode in {OP_POLYLINE, OP_POLYGON}:
-        minimum = 2 if cmd.opcode == OP_POLYLINE else 3
-        if len(g.get("points", [])) < minimum:
-            raise MCIError(f"{OP_NAMES[cmd.opcode]} requires at least {minimum} points.")
-    elif cmd.opcode == OP_PATH:
-        segments = g.get("segments", [])
-        if not segments or segments[0].get("op") != SEG_M:
-            raise MCIError("Path must begin with MoveTo.")
-        for seg in segments:
-            op = int(seg.get("op", -1))
-            expected = {SEG_M: 1, SEG_L: 1, SEG_Q: 2, SEG_C: 3, SEG_Z: 0}.get(op)
-            if expected is None or len(seg.get("points", [])) != expected:
-                raise MCIError("Malformed path segment.")
-
-
-# ---------------------------------------------------------------------------
-# SVG path parser
-# ---------------------------------------------------------------------------
+# ==========================================================================
+# SVG path parsing
+# ==========================================================================
 
 PATH_TOKEN_RE = re.compile(r"[AaCcHhLlMmQqSsTtVvZz]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
 PATH_PARAM_COUNTS = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2, "A": 7, "Z": 0}
@@ -1053,11 +613,9 @@ def parse_svg_path(data: str) -> List[Dict[str, Any]]:
         raise SVGImportError("SVG path does not begin with MoveTo.")
     return out
 
-
-# ---------------------------------------------------------------------------
+# ==========================================================================
 # SVG importer
-# ---------------------------------------------------------------------------
-
+# ==========================================================================
 
 def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
@@ -1304,49 +862,30 @@ def import_svg(path: str | Path) -> VectorDocument:
         raise SVGImportError("SVG contained no supported visible vector elements.")
     return VectorDocument(commands, 1.0, 0.0, 0.0, path.name, warnings)
 
-
-# ---------------------------------------------------------------------------
+# ==========================================================================
 # Rendering
-# ---------------------------------------------------------------------------
+# ==========================================================================
 
-
-def cubic_point(p0, p1, p2, p3, t):
-    u = 1-t
-    return (u**3*p0[0]+3*u*u*t*p1[0]+3*u*t*t*p2[0]+t**3*p3[0],
-            u**3*p0[1]+3*u*u*t*p1[1]+3*u*t*t*p2[1]+t**3*p3[1])
-
-
-def quad_point(p0, p1, p2, t):
-    u = 1-t
-    return (u*u*p0[0]+2*u*t*p1[0]+t*t*p2[0], u*u*p0[1]+2*u*t*p1[1]+t*t*p2[1])
-
-
-def flatten_path(segments: Sequence[Dict[str,Any]], steps: int = 12) -> List[Tuple[List[Tuple[float,float]], bool]]:
-    subpaths: List[Tuple[List[Tuple[float,float]], bool]] = []
-    current: List[Tuple[float,float]] = []
-    pos = (0.0,0.0)
-    start = (0.0,0.0)
-    closed = False
-    for seg in segments:
-        op = int(seg["op"]); pts = [tuple(p) for p in seg.get("points", [])]
-        if op == SEG_M:
-            if current: subpaths.append((current, closed))
-            pos = pts[0]; start = pos; current = [pos]; closed = False
-        elif op == SEG_L:
-            pos = pts[0]; current.append(pos)
-        elif op == SEG_Q:
-            c, end = pts
-            for i in range(1, steps+1): current.append(quad_point(pos,c,end,i/steps))
-            pos = end
-        elif op == SEG_C:
-            c1,c2,end = pts
-            for i in range(1, steps+1): current.append(cubic_point(pos,c1,c2,end,i/steps))
-            pos = end
-        elif op == SEG_Z:
-            if current and current[-1] != start: current.append(start)
-            pos = start; closed = True
-    if current: subpaths.append((current, closed))
-    return subpaths
+def _load_manual_font(size: int = 20):
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        return None
+    candidates = [
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "DejaVuSans-Bold.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def render_to_tk(canvas: tk.Canvas, commands: Sequence[VectorCommand]) -> None:
@@ -1403,76 +942,70 @@ def render_to_tk(canvas: tk.Canvas, commands: Sequence[VectorCommand]) -> None:
 
 
 def render_to_pillow(commands: Sequence[VectorCommand]):
-    """Rasterize commands with true source-over alpha compositing.
-
-    Every fill and stroke is first drawn into an 8-bit coverage mask.  Its
-    palette alpha is then multiplied into that mask before the colored layer
-    is composited over the accumulated image.  This avoids Pillow/Tk drawing
-    modes that can replace pixels instead of blending them and guarantees that
-    the GUI preview and exported PNG use identical SVG-style draw-order alpha.
-    """
+    """Render generic vectors and old primitives through one alpha compositor."""
     if Image is None or ImageDraw is None:
         raise MCIError("Pillow is required for PNG export.")
-
     background = color_to_rgba(BACKGROUND) or (255, 255, 255, 255)
     image = Image.new("RGBA", (CANVAS_W, CANVAS_H), background)
+    font = _load_manual_font(20)
 
     def composite_mask(draw_mask_fn, color: Tuple[int, int, int, int]) -> None:
         nonlocal image
-        r, g, b, alpha = color
+        red, green, blue, alpha = color
         if alpha <= 0:
             return
         mask = Image.new("L", (CANVAS_W, CANVAS_H), 0)
-        mask_draw = ImageDraw.Draw(mask)
-        draw_mask_fn(mask_draw)
+        draw = ImageDraw.Draw(mask)
+        draw_mask_fn(draw)
         if alpha < 255:
-            # Multiply geometric coverage by the shape's transmitted alpha.
             mask = mask.point(lambda coverage, a=alpha: (coverage * a + 127) // 255)
-        layer = Image.new("RGBA", (CANVAS_W, CANVAS_H), (r, g, b, 255))
+        layer = Image.new("RGBA", (CANVAS_W, CANVAS_H), (red, green, blue, 255))
         layer.putalpha(mask)
         image = Image.alpha_composite(image, layer)
 
-    for cmd in commands:
+    def render_one(cmd: VectorCommand) -> None:
+        if cmd.opcode == OP_PRIMITIVE:
+            kind = primitive_kind(cmd)
+            if kind == PRIM_TEXT:
+                color = color_to_rgba(cmd.style.fill or cmd.style.stroke or "#000000")
+                if color:
+                    x, y = int(cmd.geom["x"]), int(cmd.geom["y"])
+                    text = clean_primitive_text(cmd.geom.get("text", ""))
+                    composite_mask(lambda d, x=x, y=y, text=text: d.text((x, y), text, font=font, fill=255), color)
+                return
+            for vector in primitive_to_vectors(cmd) or []:
+                render_one(quantize_command(vector))
+            return
+
         s = cmd.style.normalized()
         g = cmd.geom
         fill = color_to_rgba(s.fill) if s.fill else None
         stroke = color_to_rgba(s.stroke) if s.stroke else None
         width = max(1, int(round(s.stroke_width))) if stroke else 1
-
         if cmd.opcode == OP_RECT:
             box = [g["x"], g["y"], g["x"] + g["w"], g["y"] + g["h"]]
-            if fill:
-                composite_mask(lambda d, box=box: d.rectangle(box, fill=255), fill)
-            if stroke:
-                composite_mask(lambda d, box=box, width=width: d.rectangle(box, outline=255, width=width), stroke)
-
+            if fill: composite_mask(lambda d, box=box: d.rectangle(box, fill=255), fill)
+            if stroke: composite_mask(lambda d, box=box, width=width: d.rectangle(box, outline=255, width=width), stroke)
         elif cmd.opcode == OP_ELLIPSE:
             box = [g["cx"] - g["rx"], g["cy"] - g["ry"], g["cx"] + g["rx"], g["cy"] + g["ry"]]
-            if fill:
-                composite_mask(lambda d, box=box: d.ellipse(box, fill=255), fill)
-            if stroke:
-                composite_mask(lambda d, box=box, width=width: d.ellipse(box, outline=255, width=width), stroke)
-
+            if fill: composite_mask(lambda d, box=box: d.ellipse(box, fill=255), fill)
+            if stroke: composite_mask(lambda d, box=box, width=width: d.ellipse(box, outline=255, width=width), stroke)
         elif cmd.opcode == OP_LINE:
             color = stroke or fill
             if color:
                 pts = [tuple(g["p1"]), tuple(g["p2"])]
                 composite_mask(lambda d, pts=pts, width=width: d.line(pts, fill=255, width=width), color)
-
         elif cmd.opcode == OP_POLYLINE:
             color = stroke or fill
             if color:
                 pts = [tuple(point) for point in g["points"]]
                 composite_mask(lambda d, pts=pts, width=width: d.line(pts, fill=255, width=width), color)
-
         elif cmd.opcode == OP_POLYGON:
             pts = [tuple(point) for point in g["points"]]
-            if fill:
-                composite_mask(lambda d, pts=pts: d.polygon(pts, fill=255), fill)
+            if fill: composite_mask(lambda d, pts=pts: d.polygon(pts, fill=255), fill)
             if stroke and pts:
-                closed_pts = pts + [pts[0]]
-                composite_mask(lambda d, pts=closed_pts, width=width: d.line(pts, fill=255, width=width), stroke)
-
+                closed = pts + [pts[0]]
+                composite_mask(lambda d, pts=closed, width=width: d.line(pts, fill=255, width=width), stroke)
         elif cmd.opcode == OP_PATH:
             for pts, closed in flatten_path(g["segments"], 16):
                 if fill and len(pts) >= 3:
@@ -1481,383 +1014,13 @@ def render_to_pillow(commands: Sequence[VectorCommand]):
                     line_pts = pts + ([pts[0]] if closed else [])
                     composite_mask(lambda d, pts=line_pts, width=width: d.line(pts, fill=255, width=width), stroke)
 
-    # PNG and Tk preview are intentionally flattened against the configured
-    # canvas background after all source-over blending is complete.
+    for command in commands:
+        render_one(command)
     return image.convert("RGB")
 
-
-# ---------------------------------------------------------------------------
-# Bit codec
-# ---------------------------------------------------------------------------
-
-
-class BitWriter:
-    def __init__(self): self.bits: List[int]=[]
-    def bit(self,v: int|bool): self.bits.append(1 if v else 0)
-    def bits_n(self,v:int,n:int):
-        if v<0 or v >= (1<<n): raise MCIError(f"Value {v} does not fit in {n} bits.")
-        self.bits.extend((v>>s)&1 for s in range(n-1,-1,-1))
-    def ue(self,v:int):
-        if v<0: raise MCIError("Unsigned Exp-Golomb cannot encode negative values.")
-        n=v+1; width=n.bit_length(); self.bits.extend([0]*(width-1)); self.bits_n(n,width)
-    def rice_signed(self,v:int,k:int=3):
-        z=(-v*2-1) if v<0 else v*2
-        q=z>>k; self.bits.extend([1]*q); self.bits.append(0)
-        if k: self.bits_n(z&((1<<k)-1),k)
-    def to_bytes(self)->bytes:
-        out=bytearray((len(self.bits)+7)//8)
-        for i,b in enumerate(self.bits):
-            if b: out[i//8]|=1<<(7-i%8)
-        return bytes(out)
-
-
-class BitReader:
-    def __init__(self,data:bytes): self.data=data; self.pos=0
-    def bit(self)->int:
-        if self.pos>=len(self.data)*8: raise MCIError("Unexpected end of stream.")
-        b=(self.data[self.pos//8]>>(7-self.pos%8))&1; self.pos+=1; return b
-    def bits_n(self,n:int)->int:
-        v=0
-        for _ in range(n): v=(v<<1)|self.bit()
-        return v
-    def ue(self,max_value:int=10_000_000)->int:
-        z=0
-        while self.bit()==0:
-            z+=1
-            if z>31: raise MCIError("Exp-Golomb prefix too long.")
-        v=(1<<z)+(self.bits_n(z) if z else 0)-1
-        if v>max_value: raise MCIError("Exp-Golomb value exceeds limit.")
-        return v
-    def rice_signed(self,k:int=3,max_abs:int=4096)->int:
-        q=0
-        while self.bit()==1:
-            q+=1
-            if q>8192: raise MCIError("Rice quotient too long.")
-        z=(q<<k)|(self.bits_n(k) if k else 0)
-        v=-(z//2)-1 if z&1 else z//2
-        if abs(v)>max_abs: raise MCIError("Rice value exceeds limit.")
-        return v
-
-
-@dataclass
-class PointState:
-    initialized: bool=False
-    x:int=0
-    y:int=0
-
-
-def rice_signed_length(v:int,k:int=3)->int:
-    z=(-v*2-1) if v<0 else v*2
-    return (z>>k)+1+k
-
-
-def write_point(w:BitWriter,state:PointState,p:Tuple[int,int]):
-    x,y=p
-    use_delta=state.initialized and (1+rice_signed_length(x-state.x)+rice_signed_length(y-state.y) <= 20)
-    w.bit(use_delta)
-    if use_delta:
-        w.rice_signed(x-state.x); w.rice_signed(y-state.y)
-    else:
-        w.bits_n(x,10); w.bits_n(y,9)
-    state.initialized=True; state.x=x; state.y=y
-
-
-def read_point(r:BitReader,state:PointState)->Tuple[int,int]:
-    if r.bit():
-        if not state.initialized: raise MCIError("Delta point before absolute point.")
-        x=state.x+r.rice_signed(max_abs=1440); y=state.y+r.rice_signed(max_abs=960)
-    else:
-        x=r.bits_n(10); y=r.bits_n(9)
-    if not (0<=x<CANVAS_W and 0<=y<CANVAS_H): raise MCIError(f"Point outside canvas: {x},{y}")
-    state.initialized=True; state.x=x; state.y=y
-    return x,y
-
-
-def rgb565(color:str)->int:
-    rgba=color_to_rgba(color)
-    if rgba is None: raise MCIError("Invalid color.")
-    r,g,b,_a=rgba
-    return ((r>>3)<<11)|((g>>2)<<5)|(b>>3)
-
-
-def alpha4(color: str) -> int:
-    rgba = color_to_rgba(color)
-    if rgba is None:
-        raise MCIError("Invalid color.")
-    return max(0, min(15, int(round(rgba[3] * 15 / 255))))
-
-
-def from_rgb565(v:int)->str:
-    r=((v>>11)&31)*255//31; g=((v>>5)&63)*255//63; b=(v&31)*255//31
-    return f"#{r:02X}{g:02X}{b:02X}"
-
-
-def from_rgb565_a4(v:int, a4: int) -> str:
-    a4 = max(0, min(15, int(a4)))
-    base = from_rgb565(v)
-    a = a4 * 255 // 15 if a4 else 0
-    return base if a >= 255 else f"{base}{a:02X}"
-
-
-def quantize_palette_color(color: str) -> str:
-    return from_rgb565_a4(rgb565(color), alpha4(color))
-
-
-def build_palette(commands:Sequence[VectorCommand])->List[str]:
-    palette=[]
-    for c in commands:
-        for color in (c.style.fill,c.style.stroke):
-            if color:
-                quant=quantize_palette_color(color)
-                if quant not in palette: palette.append(quant)
-    if not palette: palette=["#000000"]
-    if len(palette)>MAX_PALETTE: raise MCIError(f"Image needs {len(palette)} colors; protocol v{PROTOCOL_VERSION} supports {MAX_PALETTE}.")
-    return palette
-
-
-def style_key(style:PaintStyle,palette:Sequence[str])->Tuple[Any,...]:
-    def idx(c): return palette.index(quantize_palette_color(c)) if c else -1
-    return idx(style.fill),idx(style.stroke),max(1,min(64,int(round(style.stroke_width)))) if style.stroke else 0,style.fill_rule
-
-
-def write_style(w:BitWriter,style:PaintStyle,palette:Sequence[str]):
-    fill=style.fill is not None; stroke=style.stroke is not None
-    w.bit(fill); w.bit(stroke); w.bit(style.fill_rule=="evenodd")
-    width=max(1,(len(palette)-1).bit_length())
-    if fill: w.bits_n(palette.index(quantize_palette_color(style.fill)),width)
-    if stroke:
-        w.bits_n(palette.index(quantize_palette_color(style.stroke)),width)
-        w.ue(max(1,min(64,int(round(style.stroke_width))))-1)
-
-
-def read_style(r:BitReader,palette:Sequence[str])->PaintStyle:
-    has_fill=bool(r.bit()); has_stroke=bool(r.bit()); even=bool(r.bit())
-    width=max(1,(len(palette)-1).bit_length())
-    fill=palette[r.bits_n(width)] if has_fill else None
-    stroke=palette[r.bits_n(width)] if has_stroke else None
-    sw=r.ue(63)+1 if has_stroke else 0
-    return PaintStyle(fill,stroke,sw,"evenodd" if even else "nonzero")
-
-
-def geom_translation(prev:VectorCommand,cur:VectorCommand)->Optional[Tuple[int,int]]:
-    if prev.opcode!=cur.opcode: return None
-    if prev.style.to_json()!=cur.style.to_json(): return None
-    pa=command_points(prev); pb=command_points(cur)
-    if len(pa)!=len(pb) or not pa: return None
-    dx=int(pb[0][0])-int(pa[0][0]); dy=int(pb[0][1])-int(pa[0][1])
-    for a,b in zip(pa,pb):
-        if int(b[0])-int(a[0])!=dx or int(b[1])-int(a[1])!=dy: return None
-    # Geometric structure must also match, not merely its flattened point count.
-    a=prev.clone(); b=cur.clone()
-    a=translate_command(a,dx,dy)
-    return (dx,dy) if a.geom==b.geom else None
-
-
-def translate_command(cmd:VectorCommand,dx:int,dy:int)->VectorCommand:
-    return transform_command(cmd,mat_translate(dx,dy))
-
-
-def write_geometry(w:BitWriter,cmd:VectorCommand,state:PointState):
-    g=cmd.geom
-    if cmd.opcode==OP_RECT:
-        write_point(w,state,(int(g["x"]),int(g["y"]))); w.ue(int(g["w"])-1); w.ue(int(g["h"])-1)
-    elif cmd.opcode==OP_ELLIPSE:
-        write_point(w,state,(int(g["cx"]),int(g["cy"]))); w.ue(int(g["rx"])-1); w.ue(int(g["ry"])-1)
-    elif cmd.opcode==OP_LINE:
-        write_point(w,state,tuple(g["p1"])); write_point(w,state,tuple(g["p2"]))
-    elif cmd.opcode in {OP_POLYLINE,OP_POLYGON}:
-        pts=[tuple(p) for p in g["points"]]; minimum=2 if cmd.opcode==OP_POLYLINE else 3
-        w.ue(len(pts)-minimum)
-        for p in pts: write_point(w,state,p)
-    elif cmd.opcode==OP_PATH:
-        segs=g["segments"]; w.ue(len(segs)-1)
-        for seg in segs:
-            op=int(seg["op"]); w.bits_n(op,3)
-            for p in seg.get("points",[]): write_point(w,state,tuple(p))
-
-
-def read_geometry(r:BitReader,opcode:int,state:PointState)->Dict[str,Any]:
-    if opcode==OP_RECT:
-        x,y=read_point(r,state); return {"x":x,"y":y,"w":r.ue(719)+1,"h":r.ue(479)+1}
-    if opcode==OP_ELLIPSE:
-        cx,cy=read_point(r,state); return {"cx":cx,"cy":cy,"rx":r.ue(719)+1,"ry":r.ue(479)+1}
-    if opcode==OP_LINE:
-        return {"p1":read_point(r,state),"p2":read_point(r,state)}
-    if opcode in {OP_POLYLINE,OP_POLYGON}:
-        minimum=2 if opcode==OP_POLYLINE else 3; n=r.ue(MAX_COMMANDS)+minimum
-        return {"points":[read_point(r,state) for _ in range(n)]}
-    if opcode==OP_PATH:
-        n=r.ue(MAX_COMMANDS*8)+1; segs=[]
-        counts={SEG_M:1,SEG_L:1,SEG_Q:2,SEG_C:3,SEG_Z:0}
-        for _ in range(n):
-            op=r.bits_n(3)
-            if op not in counts: raise MCIError("Invalid path segment opcode.")
-            segs.append({"op":op,"points":[read_point(r,state) for _ in range(counts[op])]})
-        return {"segments":segs}
-    raise MCIError("Unknown opcode.")
-
-
-def encode_commands(commands:Sequence[VectorCommand])->Tuple[bytes,int,int,List[str]]:
-    commands=[quantize_command(c) for c in commands]
-    palette=build_palette(commands)
-    w=BitWriter(); w.bits_n(PROTOCOL_VERSION,4); w.ue(len(palette)-1)
-    for color in palette:
-        w.bits_n(rgb565(color),16)
-        w.bits_n(alpha4(color),4)
-    w.ue(len(commands))
-    point_states={op:PointState() for op in OP_NAMES}
-    style_states:Dict[int,Tuple[Any,...]]={}
-    recent:Dict[int,VectorCommand]={}
-    previous_opcode:Optional[int]=None
-    repeats=0
-    for cmd in commands:
-        ref=recent.get(cmd.opcode); delta=geom_translation(ref,cmd) if ref else None
-        w.bit(delta is not None)
-        if delta is not None:
-            w.bits_n(cmd.opcode,3); w.rice_signed(delta[0],2); w.rice_signed(delta[1],2); repeats+=1
-        else:
-            same_op=previous_opcode==cmd.opcode; w.bit(same_op)
-            if not same_op: w.bits_n(cmd.opcode,3)
-            key=style_key(cmd.style,palette); same_style=style_states.get(cmd.opcode)==key; w.bit(same_style)
-            if not same_style: write_style(w,cmd.style,palette); style_states[cmd.opcode]=key
-            write_geometry(w,cmd,point_states[cmd.opcode])
-        recent[cmd.opcode]=cmd.clone(); previous_opcode=cmd.opcode
-    return w.to_bytes(),len(w.bits),repeats,palette
-
-
-def decode_commands(data:bytes)->Tuple[List[VectorCommand],List[str]]:
-    r=BitReader(data)
-    if r.bits_n(4)!=PROTOCOL_VERSION: raise MCIError("Unsupported MCoreIMG SVG protocol version.")
-    palette=[from_rgb565_a4(r.bits_n(16), r.bits_n(4)) for _ in range(r.ue(MAX_PALETTE-1)+1)]
-    count=r.ue(MAX_COMMANDS)
-    point_states={op:PointState() for op in OP_NAMES}
-    style_states:Dict[int,PaintStyle]={}
-    recent:Dict[int,VectorCommand]={}
-    previous_opcode:Optional[int]=None
-    result=[]
-    for _ in range(count):
-        if r.bit():
-            op=r.bits_n(3)
-            if op not in recent: raise MCIError("Repeat references missing opcode history.")
-            cmd=translate_command(recent[op],r.rice_signed(2,719),r.rice_signed(2,479))
-            cmd=quantize_command(cmd)
-        else:
-            same=bool(r.bit())
-            if same:
-                if previous_opcode is None: raise MCIError("Same opcode before initialization.")
-                op=previous_opcode
-            else: op=r.bits_n(3)
-            if op not in OP_NAMES: raise MCIError("Invalid opcode.")
-            same_style=bool(r.bit())
-            if same_style:
-                if op not in style_states: raise MCIError("Style reuse before initialization.")
-                style=copy.deepcopy(style_states[op])
-            else:
-                style=read_style(r,palette); style_states[op]=copy.deepcopy(style)
-            cmd=VectorCommand(op,style,read_geometry(r,op,point_states[op]))
-            validate_command(cmd)
-        result.append(cmd); recent[cmd.opcode]=cmd.clone(); previous_opcode=cmd.opcode
-    return result,palette
-
-
-# ---------------------------------------------------------------------------
-# Base91 and MeshCore framing
-# ---------------------------------------------------------------------------
-
-
-def base91_encode(data:bytes)->str:
-    b=0;n=0;out=[]
-    for byte in data:
-        b|=byte<<n;n+=8
-        if n>13:
-            v=b&8191
-            if v>88: b>>=13;n-=13
-            else: v=b&16383;b>>=14;n-=14
-            out.append(BASE91[v%91]);out.append(BASE91[v//91])
-    if n:
-        out.append(BASE91[b%91])
-        if n>7 or b>90: out.append(BASE91[b//91])
-    return "".join(out)
-
-
-def base91_decode(text:str)->bytes:
-    b=0;n=0;v=-1;out=bytearray()
-    for ch in text:
-        if ch not in BASE91_INDEX: raise MCIError(f"Invalid Base91 character {ch!r}.")
-        c=BASE91_INDEX[ch]
-        if v<0: v=c
-        else:
-            v+=c*91;b|=v<<n;n+=13 if (v&8191)>88 else 14
-            while n>=8: out.append(b&255);b>>=8;n-=8
-            v=-1
-    if v>=0:
-        b|=v<<n;n+=7
-        while n>=8: out.append(b&255);b>>=8;n-=8
-    return bytes(out)
-
-
-def enc62(v:int,width:int)->str:
-    if v<0 or v>=62**width: raise MCIError("Base62 field overflow.")
-    chars=[]
-    for _ in range(width): v,r=divmod(v,62);chars.append(BASE62[r])
-    return "".join(reversed(chars))
-
-
-def dec62(s:str)->int:
-    v=0
-    for ch in s:
-        if ch not in BASE62: raise FrameError("Invalid Base62 character.")
-        v=v*62+BASE62.index(ch)
-    return v
-
-
-def frame_crc(payload:str)->int:
-    return binascii.crc_hqx(payload.encode("ascii"),0xFFFF)
-
-
-def encode_image(commands:Sequence[VectorCommand])->EncodedImage:
-    bit_bytes,bit_count,repeats,palette=encode_commands(commands)
-    raw=bit_bytes+zlib.crc32(bit_bytes).to_bytes(4,"big")
-    payload=base91_encode(raw)
-    image_id=enc62(zlib.crc32(raw)%(62**3),3)
-    chunks=[payload[i:i+FRAME_PAYLOAD_LEN] for i in range(0,len(payload),FRAME_PAYLOAD_LEN)] or [""]
-    total=len(chunks);frames=[]
-    for i,chunk in enumerate(chunks):
-        header=FRAME_MAGIC+enc62(PROTOCOL_VERSION,1)+image_id+enc62(i,1)+enc62(total,1)+enc62(len(chunk),2)+enc62(frame_crc(chunk),3)+"0"
-        frames.append(header+chunk)
-    stats=CodecStats(len(commands),len(palette),bit_count,len(raw),len(payload),total,repeats)
-    return EncodedImage(raw,payload,frames,stats,image_id,palette)
-
-
-def decode_frames(frames:Sequence[str])->List[VectorCommand]:
-    parts={};expected_total=None;image_id=None
-    for frame in frames:
-        frame=frame.strip()
-        if len(frame)<FRAME_HEADER_LEN or len(frame)>MESSAGE_LEN: raise FrameError("Invalid frame length.")
-        h,p=frame[:FRAME_HEADER_LEN],frame[FRAME_HEADER_LEN:]
-        if h[:3]!=FRAME_MAGIC or dec62(h[3])!=PROTOCOL_VERSION: raise FrameError("Wrong frame magic/version.")
-        iid=h[4:7];idx=dec62(h[7]);total=dec62(h[8]);length=dec62(h[9:11]);crc=dec62(h[11:14])
-        if total < 1 or total > MAX_MESSAGES:
-            raise FrameError(f"Frame set declares {total} parts; maximum is {MAX_MESSAGES}.")
-        if idx >= total:
-            raise FrameError("Frame index is outside the declared frame count.")
-        if length!=len(p) or crc!=frame_crc(p): raise FrameError("Frame length or CRC mismatch.")
-        if image_id is None: image_id=iid;expected_total=total
-        if iid!=image_id or total!=expected_total: raise FrameError("Mixed image frames.")
-        if idx in parts and parts[idx]!=p: raise FrameError("Conflicting duplicate frame.")
-        parts[idx]=p
-    if expected_total is None or set(parts)!=set(range(expected_total)): raise FrameError("Missing frame parts.")
-    raw=base91_decode("".join(parts[i] for i in range(expected_total)))
-    if len(raw)<4: raise FrameError("Stream too short.")
-    data,crc=raw[:-4],int.from_bytes(raw[-4:],"big")
-    if zlib.crc32(data)!=crc: raise FrameError("Stream CRC-32 mismatch.")
-    return decode_commands(data)[0]
-
-
-# ---------------------------------------------------------------------------
+# ==========================================================================
 # Source file helpers
-# ---------------------------------------------------------------------------
-
+# ==========================================================================
 
 def save_source(path:str|Path,doc:VectorDocument)->None:
     Path(path).write_text(json.dumps(doc.to_json(),indent=2)+"\n",encoding="utf-8")
@@ -1869,13 +1032,154 @@ def load_source(path:str|Path)->VectorDocument:
     obj=json.loads(path.read_text(encoding="utf-8"))
     return VectorDocument.from_json(obj)
 
+# ==========================================================================
+# Multi-SVG composition helpers
+# ==========================================================================
 
-# ---------------------------------------------------------------------------
-# Tk Constructor
-# ---------------------------------------------------------------------------
+def next_editor_group(doc: VectorDocument) -> int:
+    groups = [int(command.editor_group) for command in doc.commands if command.editor_group is not None]
+    return max(groups, default=0) + 1
 
 
-class ConstructorApp(tk.Tk):
+def assign_editor_group(commands: Sequence[VectorCommand], group_id: int) -> None:
+    for command in commands:
+        command.editor_group = int(group_id)
+
+
+def preserve_alpha_with_rgb(old_color: Optional[str], new_rgb: str) -> str:
+    rgb = normalize_hex(new_rgb)[:7]
+    if old_color:
+        normalized = normalize_hex(old_color)
+        if len(normalized) == 9:
+            return rgb + normalized[7:9]
+    return rgb
+
+
+def append_source_files(
+    target: VectorDocument,
+    paths: Sequence[str | Path],
+    base_dx: int = 0,
+    base_dy: int = 0,
+    step_dx: int = 40,
+    step_dy: int = 40,
+) -> Tuple[int, int]:
+    """Append one or more SVG/source documents without replacing current art.
+
+    Existing document transforms are baked first so newly appended artwork and
+    click-drawn primitives share the same canvas coordinate system.  Each file
+    is imported using its own SVG fit-to-canvas transform, then translated by
+    ``base + index * step``. Re-importing the same SVG therefore produces an
+    exact translated command group that protocol-v5 local-definition reuse can
+    reference instead of transmitting twice.
+    """
+    normalized_paths = [Path(item) for item in paths]
+    if not normalized_paths:
+        return 0, 0
+
+    if target.commands and (
+        abs(target.scale - 1.0) > 1e-9
+        or abs(target.offset_x) > 1e-9
+        or abs(target.offset_y) > 1e-9
+    ):
+        target.bake_transform()
+
+    appended_commands = 0
+    appended_files = 0
+    for index, path in enumerate(normalized_paths):
+        incoming = load_source(path)
+        incoming_commands = incoming.transformed_commands()
+        dx = int(base_dx) + index * int(step_dx)
+        dy = int(base_dy) + index * int(step_dy)
+        prefix = path.stem
+        group_id = next_editor_group(target)
+        for command in incoming_commands:
+            copied = translate_command(command, dx, dy)
+            copied.label = f"{prefix} #{index + 1} | {copied.label}"
+            copied.editor_group = group_id
+            target.commands.append(copied)
+        for warning in incoming.warnings:
+            target.warnings.append(f"{path.name}: {warning}")
+        appended_commands += len(incoming_commands)
+        appended_files += 1
+    return appended_files, appended_commands
+
+# ==========================================================================
+# GUI
+# ==========================================================================
+
+class MultiSVGPlacementDialog(tk.Toplevel):
+    """One compact placement dialog for a multi-file SVG append operation."""
+
+    def __init__(self, parent: tk.Misc, file_count: int):
+        super().__init__(parent)
+        self.title(f"Add {file_count} SVG file{'s' if file_count != 1 else ''}")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.result: Optional[Tuple[int, int, int, int]] = None
+
+        self.base_x = tk.IntVar(value=0)
+        self.base_y = tk.IntVar(value=0)
+        self.step_x = tk.IntVar(value=40 if file_count > 1 else 0)
+        self.step_y = tk.IntVar(value=40 if file_count > 1 else 0)
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text=("The first SVG keeps its fitted canvas position. Each later "
+                  "SVG receives the additional step offset. Selecting the same "
+                  "SVG repeatedly enables translated group-copy compression."),
+            wraplength=390,
+        ).grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+
+        fields = [
+            ("Base X", self.base_x, "Base Y", self.base_y),
+            ("Per-file step X", self.step_x, "Per-file step Y", self.step_y),
+        ]
+        for row, (left_label, left_var, right_label, right_var) in enumerate(fields, start=1):
+            ttk.Label(frame, text=left_label).grid(row=row, column=0, sticky="w", padx=(0, 4), pady=3)
+            ttk.Spinbox(frame, from_=-1440, to=1440, textvariable=left_var, width=9).grid(row=row, column=1, sticky="w", pady=3)
+            ttk.Label(frame, text=right_label).grid(row=row, column=2, sticky="w", padx=(12, 4), pady=3)
+            ttk.Spinbox(frame, from_=-960, to=960, textvariable=right_var, width=9).grid(row=row, column=3, sticky="w", pady=3)
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=3, column=0, columnspan=4, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="Add SVG(s)", command=self._accept).pack(side="right")
+        self.bind("<Return>", lambda _event: self._accept())
+        self.bind("<Escape>", lambda _event: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.update_idletasks()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
+        self.geometry(f"+{x}+{y}")
+        self.wait_visibility()
+        self.focus_set()
+        self.wait_window(self)
+
+    def _accept(self) -> None:
+        try:
+            self.result = (
+                int(self.base_x.get()), int(self.base_y.get()),
+                int(self.step_x.get()), int(self.step_y.get()),
+            )
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Invalid placement", "Placement values must be whole numbers.", parent=self)
+            return
+        self.grab_release()
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+
+
+class _DocumentAppBase(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"MCoreIMG SVG Constructor — {CONSTRUCTOR_BUILD} — {Path(__file__).name}")
@@ -2083,2073 +1387,7 @@ class ConstructorApp(tk.Tk):
         del self.doc.commands[self.selected_index];self.selected_index=None;self._refresh()
 
 
-# ---------------------------------------------------------------------------
-# Self-test
-# ---------------------------------------------------------------------------
-
-
-def sample_document()->VectorDocument:
-    return VectorDocument([
-        VectorCommand(OP_RECT,PaintStyle("#3366CC","#000000",2),{"x":30,"y":30,"w":200,"h":120},"box"),
-        VectorCommand(OP_ELLIPSE,PaintStyle("#FFCC00","#000000",2),{"cx":360,"cy":170,"rx":70,"ry":45},"oval"),
-        VectorCommand(OP_PATH,PaintStyle(None,"#CC0000",3),{"segments":[
-            {"op":SEG_M,"points":[(100,300)]},{"op":SEG_C,"points":[(180,220),(260,380),(340,300)]},
-            {"op":SEG_Q,"points":[(430,210),(520,300)]},{"op":SEG_L,"points":[(620,350)]},
-        ]},"curve"),
-        VectorCommand(OP_RECT,PaintStyle("#3366CC","#000000",2),{"x":50,"y":50,"w":200,"h":120},"translated box"),
-    ],source_name="self-test")
-
-
-def run_self_test():
-    doc=sample_document();cmds=[quantize_command(c) for c in doc.commands]
-    enc=encode_image(cmds)
-    dec=decode_frames(enc.frames)
-    def transport_signature(c:VectorCommand):
-        style=c.style.normalized()
-        return {
-            "opcode":c.opcode,
-            "fill":quantize_palette_color(style.fill) if style.fill else None,
-            "stroke":quantize_palette_color(style.stroke) if style.stroke else None,
-            "stroke_width":int(style.stroke_width),
-            "fill_rule":style.fill_rule,
-            "geom":c.geom,
-        }
-    assert [transport_signature(c) for c in dec]==[transport_signature(c) for c in cmds]
-    assert enc.stats.repeat_count>=1
-    assert MAX_MESSAGES == 10
-    assert MAX_PAYLOAD_CHARS == 1350
-    # Exercise the full ten-message envelope, including a 150-character frame.
-    envelope_commands=[]
-    ten_frame_image=None
-    for i in range(1, 64):
-        x=(i*37)%700; y=(i*53)%460
-        segments=[{"op":SEG_M,"points":[(x,y)]}]
-        for j in range(1,8):
-            segments.append({"op":SEG_C,"points":[
-                ((x+j*11+i)%720,(y+j*17+i*2)%480),
-                ((x+j*19+i*3)%720,(y+j*23+i)%480),
-                ((x+j*29+i)%720,(y+j*31+i*4)%480),
-            ]})
-        envelope_commands.append(VectorCommand(
-            OP_PATH, PaintStyle(None, f"#{(i*7919)&0xFFFFFF:06X}", 1+(i%4)),
-            {"segments":segments}, f"envelope-{i}"))
-        candidate=encode_image(envelope_commands)
-        if candidate.stats.frame_count == MAX_MESSAGES:
-            ten_frame_image=candidate
-            break
-        if candidate.stats.frame_count > MAX_MESSAGES:
-            break
-    assert ten_frame_image is not None
-    assert ten_frame_image.stats.fits
-    assert max(map(len,ten_frame_image.frames)) == MESSAGE_LEN
-    assert len(decode_frames(ten_frame_image.frames)) == len(envelope_commands)
-    # SVG parser and default fit test.
-    svg='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 100"><rect width="1000" height="100" fill="#123456"/><path d="M0 50 C250 0 750 100 1000 50" fill="none" stroke="red"/></svg>'''
-    temp=Path("/tmp/mcoreimg-svg-selftest.svg");temp.write_text(svg)
-    imported=import_svg(temp);temp.unlink(missing_ok=True)
-    bbox=commands_bbox(imported.commands)
-    assert bbox[0]>=-0.01 and bbox[1]>=-0.01 and bbox[2]<=CANVAS_W+0.01 and bbox[3]<=CANVAS_H+0.01
-    # SVG open subpaths are implicitly closed for filling.  This is common in
-    # hand-authored/minified SVGs and was the reason Cartman rendered as only
-    # a few outlines before this regression test was added.
-    open_fill = VectorCommand(OP_PATH, PaintStyle("#FF0000", None, 1), {"segments":[
-        {"op":SEG_M,"points":[(10,10)]},
-        {"op":SEG_L,"points":[(50,10)]},
-        {"op":SEG_L,"points":[(30,50)]},
-    ]}, "open-filled-triangle")
-    if Image is not None:
-        open_fill_img = render_to_pillow([open_fill])
-        assert open_fill_img.getpixel((30,25)) != ImageColor.getrgb(BACKGROUND)
-    # Alpha-channel regression: 50% red/green/blue circles must retain alpha
-    # through import, palette quantization, transport, decode, and compositing.
-    alpha_svg='''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle r="32" cx="35" cy="65" fill="#F00" opacity="0.5"/><circle r="32" cx="65" cy="65" fill="#0F0" opacity="0.5"/><circle r="32" cx="50" cy="35" fill="#00F" opacity="0.5"/></svg>'''
-    alpha_temp=Path("/tmp/mcoreimg-alpha-selftest.svg");alpha_temp.write_text(alpha_svg)
-    alpha_doc=import_svg(alpha_temp);alpha_temp.unlink(missing_ok=True)
-    assert all(alpha4(c.style.fill or "#000000") == 8 for c in alpha_doc.commands)
-    alpha_cmds=[quantize_command(c) for c in alpha_doc.commands]
-    alpha_encoded=encode_image(alpha_cmds)
-    alpha_decoded=decode_frames(alpha_encoded.frames)
-    assert all(alpha4(c.style.fill or "#000000") == 8 for c in alpha_decoded)
-    assert alpha_encoded.stats.frame_count == 1
-    if Image is not None:
-        alpha_image=render_to_pillow(alpha_decoded)
-        # A blended overlap must not equal a single-circle region and must
-        # contain contributions from multiple source colors.
-        single = alpha_image.getpixel((220,330))
-        overlap = alpha_image.getpixel((360,330))
-        assert overlap != single
-        assert overlap[0] < 255 and overlap[1] < 255 and overlap[2] < 255
-    # Frame corruption detection.
-    broken=enc.frames.copy();pos=FRAME_HEADER_LEN
-    broken[0]=broken[0][:pos]+BASE91[(BASE91_INDEX[broken[0][pos]]+1)%91]+broken[0][pos+1:]
-    try:decode_frames(broken)
-    except FrameError:pass
-    else:raise AssertionError("Corrupted frame was accepted")
-    print("MCoreIMG SVG Constructor self-test: PASS")
-    print(f"commands={enc.stats.command_count} palette={enc.stats.palette_count} bits={enc.stats.bit_count} payload={enc.stats.base91_chars} frames={enc.stats.frame_count} repeats={enc.stats.repeat_count}")
-
-
-
-# ---------------------------------------------------------------------------
-# HYBRID OVERRIDE LAYER: primitives and repeated command groups
-# ---------------------------------------------------------------------------
-#
-# IMPORTANT MAINTENANCE NOTE
-# --------------------------
-# This block intentionally redefines several helpers and codec entry points
-# from the vector-only foundation above. From this point onward, later global
-# definitions supersede earlier ones. The earlier code remains useful as the
-# imported-SVG/model/rendering foundation and as historical reference, but the
-# final encoder is defined below in the protocol-v5 layer.
-#
-# Refactor target: extract only the final active definitions into a codec_v5
-# module, then delete the superseded implementations after fixture parity.
-
-# The hybrid foundation keeps the RGB565+A4 palette and ten-message envelope, and
-# adds two orthogonal compression tools:
-#   * compact legacy/manual primitives, used only when their actual encoded
-#     representation is smaller than the equivalent generic vector commands;
-#   * translated group-copy records for repeated SVGs or repeated contiguous
-#     command groups, including nonadjacent copies.
-PROTOCOL_VERSION = 5
-SOURCE_VERSION = 5
-CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-DOCUMENTED-LOCALSPACE-HYBRID-10MSG"
-
-OP_PRIMITIVE = 6
-OP_NAMES[OP_PRIMITIVE] = "Primitive"
-
-PRIM_TEXT = 0
-PRIM_TRIANGLE_OUTLINE = 1
-PRIM_TRIANGLE_FILL = 2
-PRIM_ARROW = 3
-PRIM_STAR = 4
-PRIM_ARC = 5
-PRIM_YAGI = 6
-PRIM_DISH = 7
-PRIM_RADIO = 8
-PRIM_RADIO_WAVES = 9
-PRIM_MOON = 10
-PRIM_DOUBLE_BOX = 11
-
-PRIMITIVE_NAMES = {
-    PRIM_TEXT: "Text",
-    PRIM_TRIANGLE_OUTLINE: "Triangle Outline",
-    PRIM_TRIANGLE_FILL: "Triangle Fill",
-    PRIM_ARROW: "Arrow",
-    PRIM_STAR: "Star",
-    PRIM_ARC: "SemiCircle / Arc",
-    PRIM_YAGI: "Yagi Antenna",
-    PRIM_DISH: "Dish Antenna",
-    PRIM_RADIO: "Radio Transceiver",
-    PRIM_RADIO_WAVES: "Radio Waves",
-    PRIM_MOON: "Moon",
-    PRIM_DOUBLE_BOX: "DoubleBox",
-}
-PRIMITIVE_BY_NAME = {name: kind for kind, name in PRIMITIVE_NAMES.items()}
-
-TEXT_ALPHABET = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-+./?:,()[]#_=@!&%"
-TEXT_INDEX = {ch: i for i, ch in enumerate(TEXT_ALPHABET)}
-MAX_TEXT_LEN = 63
-assert len(TEXT_ALPHABET) <= 64
-
-REC_NORMAL = 0
-REC_SINGLE_REPEAT = 1
-REC_GROUP_REPEAT = 2
-REC_RESERVED = 3
-
-MOON_CRATER_POINTS = [
-    (1 / 5, 1 / 4, 3), (3 / 7, 5 / 8, 5), (1 / 4, 7 / 9, 4),
-    (4 / 5, 2 / 7, 2), (7 / 12, 1 / 5, 6), (2 / 3, 2 / 5, 3),
-    (5 / 8, 3 / 4, 4), (7 / 20, 3 / 7, 2), (3 / 20, 5 / 9, 5),
-    (3 / 4, 3 / 5, 3),
-]
-
-
-def _clean_primitive_text(value: Any) -> str:
-    text = str(value).upper()[:MAX_TEXT_LEN]
-    return "".join(ch if ch in TEXT_INDEX else " " for ch in text).rstrip()
-
-
-def _rotate_quarter(point: Tuple[float, float], origin: Tuple[float, float], turns: int) -> Tuple[float, float]:
-    """Rotate in 90-degree clockwise screen-coordinate steps."""
-    px, py = point
-    ox, oy = origin
-    dx, dy = px - ox, py - oy
-    for _ in range(int(turns) % 4):
-        dx, dy = -dy, dx
-    return ox + dx, oy + dy
-
-
-def _regular_polygon(cx: float, cy: float, radius: float, sides: int, rotation_deg: float) -> List[Tuple[float, float]]:
-    return [
-        (
-            cx + math.cos(math.radians(rotation_deg + 360 * i / sides)) * radius,
-            cy + math.sin(math.radians(rotation_deg + 360 * i / sides)) * radius,
-        )
-        for i in range(sides)
-    ]
-
-
-def _arc_points(cx: float, cy: float, radius: float, start_angle: int, arc_degrees: int) -> List[Tuple[float, float]]:
-    radius = max(1.0, float(radius))
-    start = int(start_angle) % 360
-    sweep = max(0, min(360, int(arc_degrees)))
-    if sweep <= 0:
-        return []
-    values = list(range(start, start + sweep + 1, 5))
-    if not values or values[-1] != start + sweep:
-        values.append(start + sweep)
-    return [
-        (
-            cx + radius * math.cos(math.radians(angle % 360)),
-            cy - radius * math.sin(math.radians(angle % 360)),
-        )
-        for angle in values
-    ]
-
-
-def _primitive_kind(cmd: VectorCommand) -> int:
-    return int(cmd.geom.get("kind", -1))
-
-
-def _primitive_anchor(cmd: VectorCommand) -> Tuple[float, float]:
-    g = cmd.geom
-    if _primitive_kind(cmd) == PRIM_DOUBLE_BOX:
-        return float(g["x1"]), float(g["y1"])
-    return float(g.get("x", 0)), float(g.get("y", 0))
-
-
-def _line_style_from(cmd: VectorCommand, width: Optional[float] = None) -> PaintStyle:
-    s = cmd.style.normalized()
-    color = s.stroke or s.fill or "#000000"
-    return PaintStyle(None, color, width if width is not None else max(1.0, s.stroke_width), "nonzero")
-
-
-def _fill_style_from(cmd: VectorCommand) -> PaintStyle:
-    s = cmd.style.normalized()
-    color = s.fill or s.stroke or "#000000"
-    return PaintStyle(color, None, 0, "nonzero")
-
-
-def primitive_to_vectors(cmd: VectorCommand) -> Optional[List[VectorCommand]]:
-    """Expand one old/manual primitive into transport-equivalent generic vectors.
-
-    Text deliberately has no generic-vector alternative because converting a
-    font into outlines would be much larger and platform-dependent. Every
-    other primitive is expanded deterministically, so the optimizer can compare
-    exact codec costs and the renderer can guarantee visual parity.
-    """
-    if cmd.opcode != OP_PRIMITIVE:
-        return [cmd.clone()]
-    validate_command(cmd)
-    g = cmd.geom
-    kind = _primitive_kind(cmd)
-    label = cmd.label or PRIMITIVE_NAMES.get(kind, "Primitive")
-    line_style = _line_style_from(cmd)
-    fill_style = _fill_style_from(cmd)
-    x = float(g.get("x", 0))
-    y = float(g.get("y", 0))
-    orientation = int(g.get("orientation", 0)) % 4
-    scale = max(1, int(g.get("scale", 1)))
-
-    def line(p1: Tuple[float, float], p2: Tuple[float, float], suffix: str = "") -> VectorCommand:
-        return VectorCommand(OP_LINE, copy.deepcopy(line_style), {"p1": p1, "p2": p2}, f"{label}{suffix}")
-
-    if kind == PRIM_TEXT:
-        return None
-
-    if kind in {PRIM_TRIANGLE_OUTLINE, PRIM_TRIANGLE_FILL}:
-        points = _regular_polygon(x, y, 18 * scale, 3, -90 + orientation * 90)
-        style = fill_style if kind == PRIM_TRIANGLE_FILL else line_style
-        return [VectorCommand(OP_POLYGON, style, {"points": points}, label)]
-
-    if kind == PRIM_ARROW:
-        pts = [
-            (x, y), (x - 8 * scale, y + 18 * scale), (x - 3 * scale, y + 18 * scale),
-            (x - 3 * scale, y + 45 * scale), (x + 3 * scale, y + 45 * scale),
-            (x + 3 * scale, y + 18 * scale), (x + 8 * scale, y + 18 * scale),
-        ]
-        pts = [_rotate_quarter(p, (x, y), orientation) for p in pts]
-        return [VectorCommand(OP_POLYGON, fill_style, {"points": pts}, label)]
-
-    if kind == PRIM_STAR:
-        radius = max(1, int(g.get("radius", 35))) * scale
-        diagonal = round(radius / math.sqrt(2))
-        return [
-            line((x, y - radius), (x, y + radius), " vertical"),
-            line((x - radius, y), (x + radius, y), " horizontal"),
-            line((x - diagonal, y - diagonal), (x + diagonal, y + diagonal), " diagonal 1"),
-            line((x + diagonal, y - diagonal), (x - diagonal, y + diagonal), " diagonal 2"),
-        ]
-
-    if kind == PRIM_ARC:
-        pts = _arc_points(x, y, max(1, int(g.get("radius", 35))) * scale,
-                          int(g.get("start_angle", 0)), int(g.get("arc_degrees", 180)))
-        if len(pts) < 2:
-            pts = [(x, y), (x + 1, y)]
-        return [VectorCommand(OP_POLYLINE, line_style, {"points": pts}, label)]
-
-    if kind == PRIM_YAGI:
-        axis_start = _rotate_quarter((x + 30 * scale, y), (x, y), orientation)
-        axis_end = _rotate_quarter((x, y + 100 * scale), (x, y), orientation)
-        style = PaintStyle(None, line_style.stroke, max(1, 2 * scale), "nonzero")
-        result = [VectorCommand(OP_LINE, style, {"p1": axis_start, "p2": axis_end}, f"{label} boom")]
-        for index, t in enumerate((0.15, 0.35, 0.55, 0.75), 1):
-            ax = (1 - t) * (x + 30 * scale) + t * x
-            ay = (1 - t) * y + t * (y + 100 * scale)
-            p1 = _rotate_quarter((ax - 8 * scale, ay - 3 * scale), (x, y), orientation)
-            p2 = _rotate_quarter((ax + 8 * scale, ay + 3 * scale), (x, y), orientation)
-            result.append(VectorCommand(OP_LINE, copy.deepcopy(style), {"p1": p1, "p2": p2}, f"{label} element {index}"))
-        return result
-
-    if kind == PRIM_DISH:
-        facing = orientation % 2
-        radius = 40 * scale
-        flip = -1 if facing == 0 else 1
-        bowl = []
-        for angle in range(90, 181, 5):
-            theta = math.radians(angle)
-            bowl.append((x + round(radius * math.cos(theta)) * flip, y + round(radius * math.sin(theta))))
-        width_style = PaintStyle(None, line_style.stroke, 3, "nonzero")
-        result: List[VectorCommand] = [VectorCommand(OP_POLYLINE, width_style, {"points": bowl}, f"{label} reflector")]
-        result.append(VectorCommand(OP_LINE, copy.deepcopy(width_style), {"p1": (x, y), "p2": (x - radius * flip, y)}, f"{label} support 1"))
-        result.append(VectorCommand(OP_LINE, copy.deepcopy(width_style), {"p1": (x, y), "p2": (x, y + radius)}, f"{label} support 2"))
-        mid_x = round((-radius / math.sqrt(2)) * flip)
-        mid_y = round(radius / math.sqrt(2))
-        result.append(VectorCommand(OP_LINE, copy.deepcopy(width_style), {"p1": (x + mid_x, y + mid_y), "p2": (x + mid_x, y + mid_y + 30 * scale)}, f"{label} mast"))
-        result.append(VectorCommand(OP_ELLIPSE, fill_style, {"cx": x, "cy": y, "rx": 5 * scale, "ry": 5 * scale}, f"{label} hub"))
-        return result
-
-    if kind == PRIM_RADIO:
-        # Preserve the proven old geometry. Orientation was historically stored
-        # but intentionally ignored by the renderer.
-        width_style = PaintStyle(None, line_style.stroke, 3, "nonzero")
-        return [
-            VectorCommand(OP_RECT, copy.deepcopy(width_style), {"x": x, "y": y, "w": 50 * scale, "h": 20 * scale}, f"{label} body"),
-            VectorCommand(OP_ELLIPSE, copy.deepcopy(width_style), {"cx": x + 10 * scale, "cy": y + 10 * scale, "rx": 5 * scale, "ry": 5 * scale}, f"{label} knob"),
-            VectorCommand(OP_RECT, copy.deepcopy(width_style), {"x": x + 25 * scale, "y": y + 5 * scale, "w": 20 * scale, "h": 10 * scale}, f"{label} screen"),
-        ]
-
-    if kind == PRIM_RADIO_WAVES:
-        radius = max(1, int(g.get("radius", 10)))
-        base = radius * scale
-        spacing = 2 * radius * scale
-        result = []
-        for index, offset in enumerate((0, spacing, 2 * spacing), 1):
-            pts = _arc_points(x, y, base + offset, int(g.get("start_angle", 0)), int(g.get("arc_degrees", 180)))
-            if len(pts) >= 2:
-                result.append(VectorCommand(OP_POLYLINE, copy.deepcopy(line_style), {"points": pts}, f"{label} {index}"))
-        return result or [line((x, y), (x + 1, y))]
-
-    if kind == PRIM_MOON:
-        radius = 36 * scale
-        result = [VectorCommand(OP_ELLIPSE, fill_style, {"cx": x, "cy": y, "rx": radius, "ry": radius}, f"{label} body")]
-        crater = quantize_palette_color(str(g.get("crater_color", "#808080")))
-        crater_style = PaintStyle(None, crater, 3, "nonzero")
-        left, top, diameter = x - radius, y - radius, radius * 2
-        for index, (fx, fy, base_radius) in enumerate(MOON_CRATER_POINTS, 1):
-            cx = left + diameter * fx
-            cy = top + diameter * fy
-            result.append(VectorCommand(OP_ELLIPSE, copy.deepcopy(crater_style), {"cx": cx, "cy": cy, "rx": base_radius * scale, "ry": base_radius * scale}, f"{label} crater {index}"))
-        return result
-
-    if kind == PRIM_DOUBLE_BOX:
-        x1, y1 = float(g["x1"]), float(g["y1"])
-        x2, y2 = float(g["x2"]), float(g["y2"])
-        left, right = min(x1, x2), max(x1, x2)
-        top, bottom = min(y1, y2), max(y1, y2)
-        divider = top + (bottom - top) * max(0, min(100, int(g.get("percent", 50)))) / 100.0
-        return [
-            VectorCommand(OP_RECT, copy.deepcopy(line_style), {"x": left, "y": top, "w": max(1, right - left), "h": max(1, bottom - top)}, f"{label} box"),
-            VectorCommand(OP_LINE, copy.deepcopy(line_style), {"p1": (left, divider), "p2": (right, divider)}, f"{label} divider"),
-        ]
-
-    raise MCIError(f"Unknown primitive kind {kind}.")
-
-
-_v3_validate_command = validate_command
-_v3_command_points = command_points
-_v3_transform_command = transform_command
-_v3_quantize_command = quantize_command
-_v3_build_palette = build_palette
-_v3_translate_command = translate_command
-_v3_geom_translation = geom_translation
-_v3_render_to_pillow = render_to_pillow
-_BaseConstructorApp = ConstructorApp
-
-
-def validate_command(cmd: VectorCommand) -> None:
-    if cmd.opcode != OP_PRIMITIVE:
-        _v3_validate_command(cmd)
-        return
-    kind = _primitive_kind(cmd)
-    if kind not in PRIMITIVE_NAMES:
-        raise MCIError(f"Unknown primitive kind {kind}.")
-    s = cmd.style.normalized()
-    if s.fill is None and s.stroke is None:
-        raise MCIError("A primitive must have a fill or stroke color.")
-    g = cmd.geom
-
-    def require_number(name: str) -> float:
-        if name not in g:
-            raise MCIError(f"{PRIMITIVE_NAMES[kind]} requires {name}.")
-        return float(g[name])
-
-    if kind == PRIM_DOUBLE_BOX:
-        for key in ("x1", "y1", "x2", "y2"):
-            require_number(key)
-        percent = int(g.get("percent", 50))
-        if not 0 <= percent <= 100:
-            raise MCIError("DoubleBox percent must be 0..100.")
-    else:
-        require_number("x"); require_number("y")
-    if kind == PRIM_TEXT:
-        if len(_clean_primitive_text(g.get("text", ""))) > MAX_TEXT_LEN:
-            raise MCIError("Text is too long.")
-    if kind in {PRIM_TRIANGLE_OUTLINE, PRIM_TRIANGLE_FILL, PRIM_ARROW, PRIM_YAGI, PRIM_DISH, PRIM_RADIO}:
-        if not 0 <= int(g.get("orientation", 0)) <= 3:
-            raise MCIError("Orientation must be 0..3.")
-        if not 1 <= int(g.get("scale", 1)) <= 64:
-            raise MCIError("Scale must be 1..64.")
-    if kind in {PRIM_STAR, PRIM_ARC, PRIM_RADIO_WAVES}:
-        if not 1 <= int(g.get("radius", 1)) <= 128:
-            raise MCIError("Radius must be 1..128.")
-        if not 1 <= int(g.get("scale", 1)) <= 64:
-            raise MCIError("Scale must be 1..64.")
-    if kind in {PRIM_ARC, PRIM_RADIO_WAVES}:
-        if not 0 <= int(g.get("start_angle", 0)) <= 360:
-            raise MCIError("Start angle must be 0..360.")
-        if not 0 <= int(g.get("arc_degrees", 0)) <= 360:
-            raise MCIError("Arc degrees must be 0..360.")
-    if kind == PRIM_MOON:
-        if not 1 <= int(g.get("scale", 1)) <= 64:
-            raise MCIError("Scale must be 1..64.")
-        normalize_hex(str(g.get("crater_color", "#808080")))
-
-
-def command_points(cmd: VectorCommand) -> List[Tuple[float, float]]:
-    if cmd.opcode != OP_PRIMITIVE:
-        return _v3_command_points(cmd)
-    kind = _primitive_kind(cmd)
-    g = cmd.geom
-    if kind == PRIM_TEXT:
-        x, y = float(g["x"]), float(g["y"])
-        text = _clean_primitive_text(g.get("text", ""))
-        return [(x, y), (x + max(1, len(text)) * 13, y + 22)]
-    expanded = primitive_to_vectors(cmd)
-    return [p for vector in (expanded or []) for p in _v3_command_points(vector)]
-
-
-def transform_command(cmd: VectorCommand, m: Matrix) -> VectorCommand:
-    if cmd.opcode != OP_PRIMITIVE:
-        return _v3_transform_command(cmd, m)
-    out = cmd.clone()
-    g = out.geom
-    kind = _primitive_kind(out)
-    a, b, c, d, _e, _f = m
-    sx, sy = math.hypot(a, b), math.hypot(c, d)
-    scale_factor = max(1e-9, (sx + sy) / 2.0)
-    out.style.stroke_width *= scale_factor
-    if kind == PRIM_DOUBLE_BOX:
-        g["x1"], g["y1"] = apply_mat(m, (float(g["x1"]), float(g["y1"])))
-        g["x2"], g["y2"] = apply_mat(m, (float(g["x2"]), float(g["y2"])))
-    else:
-        g["x"], g["y"] = apply_mat(m, (float(g["x"]), float(g["y"])))
-    if "scale" in g:
-        g["scale"] = max(1, min(64, int(round(float(g["scale"]) * scale_factor))))
-    if "radius" in g and "scale" not in g:
-        g["radius"] = max(1, min(128, int(round(float(g["radius"]) * scale_factor))))
-    return out
-
-
-def quantize_command(cmd: VectorCommand) -> VectorCommand:
-    if cmd.opcode != OP_PRIMITIVE:
-        return _v3_quantize_command(cmd)
-    out = cmd.clone()
-    out.style = out.style.normalized()
-    if out.style.stroke:
-        out.style.stroke_width = max(1, min(64, int(round(out.style.stroke_width))))
-    g = out.geom
-    kind = _primitive_kind(out)
-    g["kind"] = kind
-    if kind == PRIM_DOUBLE_BOX:
-        g["x1"] = clamp_int(g["x1"], 0, CANVAS_W - 1)
-        g["y1"] = clamp_int(g["y1"], 0, CANVAS_H - 1)
-        g["x2"] = clamp_int(g["x2"], 0, CANVAS_W - 1)
-        g["y2"] = clamp_int(g["y2"], 0, CANVAS_H - 1)
-        g["percent"] = max(0, min(100, int(round(g.get("percent", 50)))))
-    else:
-        g["x"] = clamp_int(g["x"], 0, CANVAS_W - 1)
-        g["y"] = clamp_int(g["y"], 0, CANVAS_H - 1)
-    if "orientation" in g:
-        g["orientation"] = int(g["orientation"]) % 4
-    if "scale" in g:
-        g["scale"] = max(1, min(64, int(round(g["scale"]))))
-    if "radius" in g:
-        g["radius"] = max(1, min(128, int(round(g["radius"]))))
-    if "start_angle" in g:
-        g["start_angle"] = max(0, min(360, int(round(g["start_angle"]))))
-    if "arc_degrees" in g:
-        g["arc_degrees"] = max(0, min(360, int(round(g["arc_degrees"]))))
-    if kind == PRIM_TEXT:
-        g["text"] = _clean_primitive_text(g.get("text", ""))
-    if kind == PRIM_MOON:
-        g["crater_color"] = quantize_palette_color(str(g.get("crater_color", "#808080")))
-    validate_command(out)
-    return out
-
-
-def build_palette(commands: Sequence[VectorCommand]) -> List[str]:
-    palette: List[str] = []
-    for command in commands:
-        for color in (command.style.fill, command.style.stroke):
-            if color:
-                quant = quantize_palette_color(color)
-                if quant not in palette:
-                    palette.append(quant)
-        if command.opcode == OP_PRIMITIVE and _primitive_kind(command) == PRIM_MOON:
-            crater = quantize_palette_color(str(command.geom.get("crater_color", "#808080")))
-            if crater not in palette:
-                palette.append(crater)
-    if not palette:
-        palette = ["#000000"]
-    if len(palette) > MAX_PALETTE:
-        raise MCIError(f"Image needs {len(palette)} colors; protocol v{PROTOCOL_VERSION} supports {MAX_PALETTE}.")
-    return palette
-
-
-def translate_command(cmd: VectorCommand, dx: int, dy: int) -> VectorCommand:
-    return transform_command(cmd, mat_translate(dx, dy))
-
-
-def _style_transport_signature(style: PaintStyle) -> Tuple[Any, ...]:
-    normalized = style.normalized()
-    return (
-        quantize_palette_color(normalized.fill) if normalized.fill else None,
-        quantize_palette_color(normalized.stroke) if normalized.stroke else None,
-        max(1, min(64, int(round(normalized.stroke_width)))) if normalized.stroke else 0,
-        normalized.fill_rule,
-    )
-
-
-def geom_translation(prev: VectorCommand, cur: VectorCommand) -> Optional[Tuple[int, int]]:
-    if prev.opcode != cur.opcode or _style_transport_signature(prev.style) != _style_transport_signature(cur.style):
-        return None
-    if prev.opcode == OP_PRIMITIVE and _primitive_kind(prev) != _primitive_kind(cur):
-        return None
-    pa = command_points(prev)
-    pb = command_points(cur)
-    if len(pa) != len(pb) or not pa:
-        return None
-    dx = int(round(pb[0][0] - pa[0][0]))
-    dy = int(round(pb[0][1] - pa[0][1]))
-    translated = quantize_command(translate_command(prev, dx, dy))
-    target = quantize_command(cur)
-    if translated.opcode != target.opcode:
-        return None
-    if translated.style.to_json() != target.style.to_json() or translated.geom != target.geom:
-        return None
-    return dx, dy
-
-
-def _load_manual_font(size: int = 20):
-    try:
-        from PIL import ImageFont
-    except ImportError:
-        return None
-    candidates = [
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "DejaVuSans-Bold.ttf",
-    ]
-    for candidate in candidates:
-        try:
-            return ImageFont.truetype(candidate, size)
-        except OSError:
-            continue
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
-
-
-def render_to_pillow(commands: Sequence[VectorCommand]):
-    """Render generic vectors and old primitives through one alpha compositor."""
-    if Image is None or ImageDraw is None:
-        raise MCIError("Pillow is required for PNG export.")
-    background = color_to_rgba(BACKGROUND) or (255, 255, 255, 255)
-    image = Image.new("RGBA", (CANVAS_W, CANVAS_H), background)
-    font = _load_manual_font(20)
-
-    def composite_mask(draw_mask_fn, color: Tuple[int, int, int, int]) -> None:
-        nonlocal image
-        red, green, blue, alpha = color
-        if alpha <= 0:
-            return
-        mask = Image.new("L", (CANVAS_W, CANVAS_H), 0)
-        draw = ImageDraw.Draw(mask)
-        draw_mask_fn(draw)
-        if alpha < 255:
-            mask = mask.point(lambda coverage, a=alpha: (coverage * a + 127) // 255)
-        layer = Image.new("RGBA", (CANVAS_W, CANVAS_H), (red, green, blue, 255))
-        layer.putalpha(mask)
-        image = Image.alpha_composite(image, layer)
-
-    def render_one(cmd: VectorCommand) -> None:
-        if cmd.opcode == OP_PRIMITIVE:
-            kind = _primitive_kind(cmd)
-            if kind == PRIM_TEXT:
-                color = color_to_rgba(cmd.style.fill or cmd.style.stroke or "#000000")
-                if color:
-                    x, y = int(cmd.geom["x"]), int(cmd.geom["y"])
-                    text = _clean_primitive_text(cmd.geom.get("text", ""))
-                    composite_mask(lambda d, x=x, y=y, text=text: d.text((x, y), text, font=font, fill=255), color)
-                return
-            for vector in primitive_to_vectors(cmd) or []:
-                render_one(quantize_command(vector))
-            return
-
-        s = cmd.style.normalized()
-        g = cmd.geom
-        fill = color_to_rgba(s.fill) if s.fill else None
-        stroke = color_to_rgba(s.stroke) if s.stroke else None
-        width = max(1, int(round(s.stroke_width))) if stroke else 1
-        if cmd.opcode == OP_RECT:
-            box = [g["x"], g["y"], g["x"] + g["w"], g["y"] + g["h"]]
-            if fill: composite_mask(lambda d, box=box: d.rectangle(box, fill=255), fill)
-            if stroke: composite_mask(lambda d, box=box, width=width: d.rectangle(box, outline=255, width=width), stroke)
-        elif cmd.opcode == OP_ELLIPSE:
-            box = [g["cx"] - g["rx"], g["cy"] - g["ry"], g["cx"] + g["rx"], g["cy"] + g["ry"]]
-            if fill: composite_mask(lambda d, box=box: d.ellipse(box, fill=255), fill)
-            if stroke: composite_mask(lambda d, box=box, width=width: d.ellipse(box, outline=255, width=width), stroke)
-        elif cmd.opcode == OP_LINE:
-            color = stroke or fill
-            if color:
-                pts = [tuple(g["p1"]), tuple(g["p2"])]
-                composite_mask(lambda d, pts=pts, width=width: d.line(pts, fill=255, width=width), color)
-        elif cmd.opcode == OP_POLYLINE:
-            color = stroke or fill
-            if color:
-                pts = [tuple(point) for point in g["points"]]
-                composite_mask(lambda d, pts=pts, width=width: d.line(pts, fill=255, width=width), color)
-        elif cmd.opcode == OP_POLYGON:
-            pts = [tuple(point) for point in g["points"]]
-            if fill: composite_mask(lambda d, pts=pts: d.polygon(pts, fill=255), fill)
-            if stroke and pts:
-                closed = pts + [pts[0]]
-                composite_mask(lambda d, pts=closed, width=width: d.line(pts, fill=255, width=width), stroke)
-        elif cmd.opcode == OP_PATH:
-            for pts, closed in flatten_path(g["segments"], 16):
-                if fill and len(pts) >= 3:
-                    composite_mask(lambda d, pts=pts: d.polygon(pts, fill=255), fill)
-                if stroke and len(pts) >= 2:
-                    line_pts = pts + ([pts[0]] if closed else [])
-                    composite_mask(lambda d, pts=line_pts, width=width: d.line(pts, fill=255, width=width), stroke)
-
-    for command in commands:
-        render_one(command)
-    return image.convert("RGB")
-
-
-# ---- v4 bitstream ---------------------------------------------------------
-
-
-def _ue_length(value: int) -> int:
-    number = int(value) + 1
-    return number.bit_length() * 2 - 1
-
-
-def _state_params(state: PointState) -> Dict[str, int]:
-    params = getattr(state, "params", None)
-    if params is None:
-        params = {}
-        setattr(state, "params", params)
-    return params
-
-
-def _write_stateful_fixed_v4(w: BitWriter, state: PointState, key: str, value: int, width: int) -> None:
-    params = _state_params(state)
-    same = params.get(key) == value
-    w.bit(same)
-    if not same:
-        w.bits_n(value, width)
-        params[key] = value
-
-
-def _read_stateful_fixed_v4(r: BitReader, state: PointState, key: str, width: int) -> int:
-    params = _state_params(state)
-    if r.bit():
-        if key not in params:
-            raise MCIError(f"Primitive state {key!r} reused before initialization.")
-        return params[key]
-    value = r.bits_n(width)
-    params[key] = value
-    return value
-
-
-def _write_stateful_ue_v4(w: BitWriter, state: PointState, key: str, value: int) -> None:
-    params = _state_params(state)
-    same = params.get(key) == value
-    w.bit(same)
-    if not same:
-        w.ue(value)
-        params[key] = value
-
-
-def _read_stateful_ue_v4(r: BitReader, state: PointState, key: str, max_value: int) -> int:
-    params = _state_params(state)
-    if r.bit():
-        if key not in params:
-            raise MCIError(f"Primitive state {key!r} reused before initialization.")
-        return params[key]
-    value = r.ue(max_value)
-    params[key] = value
-    return value
-
-
-def write_geometry(w: BitWriter, cmd: VectorCommand, state: PointState, palette: Optional[Sequence[str]] = None) -> None:
-    if cmd.opcode != OP_PRIMITIVE:
-        g = cmd.geom
-        if cmd.opcode == OP_RECT:
-            write_point(w, state, (int(g["x"]), int(g["y"]))); w.ue(int(g["w"]) - 1); w.ue(int(g["h"]) - 1)
-        elif cmd.opcode == OP_ELLIPSE:
-            write_point(w, state, (int(g["cx"]), int(g["cy"]))); w.ue(int(g["rx"]) - 1); w.ue(int(g["ry"]) - 1)
-        elif cmd.opcode == OP_LINE:
-            write_point(w, state, tuple(g["p1"])); write_point(w, state, tuple(g["p2"]))
-        elif cmd.opcode in {OP_POLYLINE, OP_POLYGON}:
-            pts = [tuple(p) for p in g["points"]]; minimum = 2 if cmd.opcode == OP_POLYLINE else 3
-            w.ue(len(pts) - minimum)
-            for point in pts: write_point(w, state, point)
-        elif cmd.opcode == OP_PATH:
-            segments = g["segments"]; w.ue(len(segments) - 1)
-            for segment in segments:
-                w.bits_n(int(segment["op"]), 3)
-                for point in segment.get("points", []): write_point(w, state, tuple(point))
-        else:
-            raise MCIError("Unknown geometry opcode.")
-        return
-
-    if palette is None:
-        raise MCIError("Primitive encoding requires the palette.")
-    g = cmd.geom
-    kind = _primitive_kind(cmd)
-    _write_stateful_fixed_v4(w, state, "primitive_kind", kind, 4)
-    if kind == PRIM_DOUBLE_BOX:
-        write_point(w, state, (int(g["x1"]), int(g["y1"])))
-        write_point(w, state, (int(g["x2"]), int(g["y2"])))
-        _write_stateful_ue_v4(w, state, "percent", int(g.get("percent", 50)))
-        return
-    write_point(w, state, (int(g["x"]), int(g["y"])))
-    if kind == PRIM_TEXT:
-        text = _clean_primitive_text(g.get("text", ""))
-        w.ue(len(text))
-        for char in text: w.bits_n(TEXT_INDEX[char], 6)
-    elif kind in {PRIM_TRIANGLE_OUTLINE, PRIM_TRIANGLE_FILL, PRIM_ARROW, PRIM_YAGI, PRIM_DISH, PRIM_RADIO}:
-        _write_stateful_fixed_v4(w, state, f"orientation_{kind}", int(g.get("orientation", 0)) % 4, 2)
-        _write_stateful_ue_v4(w, state, f"scale_{kind}", int(g.get("scale", 1)) - 1)
-    elif kind == PRIM_STAR:
-        _write_stateful_ue_v4(w, state, "star_radius", int(g.get("radius", 35)) - 1)
-        _write_stateful_ue_v4(w, state, "star_scale", int(g.get("scale", 1)) - 1)
-    elif kind in {PRIM_ARC, PRIM_RADIO_WAVES}:
-        prefix = "arc" if kind == PRIM_ARC else "waves"
-        _write_stateful_ue_v4(w, state, f"{prefix}_radius", int(g.get("radius", 35)) - 1)
-        _write_stateful_ue_v4(w, state, f"{prefix}_scale", int(g.get("scale", 1)) - 1)
-        _write_stateful_fixed_v4(w, state, f"{prefix}_start", int(g.get("start_angle", 0)), 9)
-        _write_stateful_fixed_v4(w, state, f"{prefix}_degrees", int(g.get("arc_degrees", 180)), 9)
-    elif kind == PRIM_MOON:
-        _write_stateful_ue_v4(w, state, "moon_scale", int(g.get("scale", 1)) - 1)
-        width = max(1, (len(palette) - 1).bit_length())
-        crater = quantize_palette_color(str(g.get("crater_color", "#808080")))
-        w.bits_n(palette.index(crater), width)
-    else:
-        raise MCIError(f"Unsupported primitive kind {kind}.")
-
-
-def read_geometry(r: BitReader, opcode: int, state: PointState, palette: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    if opcode != OP_PRIMITIVE:
-        if opcode == OP_RECT:
-            x, y = read_point(r, state); return {"x": x, "y": y, "w": r.ue(719) + 1, "h": r.ue(479) + 1}
-        if opcode == OP_ELLIPSE:
-            cx, cy = read_point(r, state); return {"cx": cx, "cy": cy, "rx": r.ue(719) + 1, "ry": r.ue(479) + 1}
-        if opcode == OP_LINE:
-            return {"p1": read_point(r, state), "p2": read_point(r, state)}
-        if opcode in {OP_POLYLINE, OP_POLYGON}:
-            minimum = 2 if opcode == OP_POLYLINE else 3; count = r.ue(MAX_COMMANDS) + minimum
-            return {"points": [read_point(r, state) for _ in range(count)]}
-        if opcode == OP_PATH:
-            count = r.ue(MAX_COMMANDS * 8) + 1; segments = []
-            point_counts = {SEG_M: 1, SEG_L: 1, SEG_Q: 2, SEG_C: 3, SEG_Z: 0}
-            for _ in range(count):
-                operation = r.bits_n(3)
-                if operation not in point_counts: raise MCIError("Invalid path segment opcode.")
-                segments.append({"op": operation, "points": [read_point(r, state) for _ in range(point_counts[operation])]})
-            return {"segments": segments}
-        raise MCIError("Unknown opcode.")
-
-    if palette is None:
-        raise MCIError("Primitive decoding requires the palette.")
-    kind = _read_stateful_fixed_v4(r, state, "primitive_kind", 4)
-    if kind not in PRIMITIVE_NAMES:
-        raise MCIError(f"Invalid primitive kind {kind}.")
-    g: Dict[str, Any] = {"kind": kind}
-    if kind == PRIM_DOUBLE_BOX:
-        g["x1"], g["y1"] = read_point(r, state)
-        g["x2"], g["y2"] = read_point(r, state)
-        g["percent"] = _read_stateful_ue_v4(r, state, "percent", 100)
-        return g
-    g["x"], g["y"] = read_point(r, state)
-    if kind == PRIM_TEXT:
-        length = r.ue(MAX_TEXT_LEN)
-        chars = []
-        for _ in range(length):
-            index = r.bits_n(6)
-            if index >= len(TEXT_ALPHABET): raise MCIError("Invalid text symbol.")
-            chars.append(TEXT_ALPHABET[index])
-        g["text"] = "".join(chars)
-    elif kind in {PRIM_TRIANGLE_OUTLINE, PRIM_TRIANGLE_FILL, PRIM_ARROW, PRIM_YAGI, PRIM_DISH, PRIM_RADIO}:
-        g["orientation"] = _read_stateful_fixed_v4(r, state, f"orientation_{kind}", 2)
-        g["scale"] = _read_stateful_ue_v4(r, state, f"scale_{kind}", 63) + 1
-    elif kind == PRIM_STAR:
-        g["radius"] = _read_stateful_ue_v4(r, state, "star_radius", 127) + 1
-        g["scale"] = _read_stateful_ue_v4(r, state, "star_scale", 63) + 1
-    elif kind in {PRIM_ARC, PRIM_RADIO_WAVES}:
-        prefix = "arc" if kind == PRIM_ARC else "waves"
-        g["radius"] = _read_stateful_ue_v4(r, state, f"{prefix}_radius", 127) + 1
-        g["scale"] = _read_stateful_ue_v4(r, state, f"{prefix}_scale", 63) + 1
-        g["start_angle"] = _read_stateful_fixed_v4(r, state, f"{prefix}_start", 9)
-        g["arc_degrees"] = _read_stateful_fixed_v4(r, state, f"{prefix}_degrees", 9)
-    elif kind == PRIM_MOON:
-        g["scale"] = _read_stateful_ue_v4(r, state, "moon_scale", 63) + 1
-        width = max(1, (len(palette) - 1).bit_length())
-        index = r.bits_n(width)
-        if index >= len(palette): raise MCIError("Invalid moon crater palette index.")
-        g["crater_color"] = palette[index]
-    return g
-
-
-@dataclass
-class EncoderStateV4:
-    point_states: Dict[int, PointState] = field(default_factory=lambda: {op: PointState() for op in OP_NAMES})
-    style_states: Dict[int, Tuple[Any, ...]] = field(default_factory=dict)
-    recent: Dict[int, VectorCommand] = field(default_factory=dict)
-    previous_opcode: Optional[int] = None
-
-    def clone(self) -> "EncoderStateV4":
-        return copy.deepcopy(self)
-
-
-def _update_history(state: EncoderStateV4, commands: Sequence[VectorCommand]) -> None:
-    for command in commands:
-        state.recent[command.opcode] = command.clone()
-        state.previous_opcode = command.opcode
-
-
-def _write_normal_record(w: BitWriter, state: EncoderStateV4, cmd: VectorCommand, palette: Sequence[str]) -> None:
-    w.bits_n(REC_NORMAL, 2)
-    same_opcode = state.previous_opcode == cmd.opcode
-    w.bit(same_opcode)
-    if not same_opcode:
-        w.bits_n(cmd.opcode, 3)
-    key = style_key(cmd.style, palette)
-    same_style = state.style_states.get(cmd.opcode) == key
-    w.bit(same_style)
-    if not same_style:
-        write_style(w, cmd.style, palette)
-        state.style_states[cmd.opcode] = key
-    write_geometry(w, cmd, state.point_states[cmd.opcode], palette)
-    _update_history(state, [cmd])
-
-
-def _write_single_repeat_record(w: BitWriter, state: EncoderStateV4, cmd: VectorCommand, delta: Tuple[int, int]) -> None:
-    w.bits_n(REC_SINGLE_REPEAT, 2)
-    w.bits_n(cmd.opcode, 3)
-    w.rice_signed(delta[0], 2)
-    w.rice_signed(delta[1], 2)
-    _update_history(state, [cmd])
-
-
-def _best_single_or_normal(cmd: VectorCommand, state: EncoderStateV4, palette: Sequence[str]) -> Tuple[BitWriter, EncoderStateV4, bool]:
-    normal_writer = BitWriter(); normal_state = state.clone()
-    _write_normal_record(normal_writer, normal_state, cmd, palette)
-    repeat_writer: Optional[BitWriter] = None
-    repeat_state: Optional[EncoderStateV4] = None
-    reference = state.recent.get(cmd.opcode)
-    delta = geom_translation(reference, cmd) if reference is not None else None
-    if delta is not None:
-        repeat_writer = BitWriter(); repeat_state = state.clone()
-        _write_single_repeat_record(repeat_writer, repeat_state, cmd, delta)
-    if repeat_writer is not None and len(repeat_writer.bits) < len(normal_writer.bits):
-        assert repeat_state is not None
-        return repeat_writer, repeat_state, True
-    return normal_writer, normal_state, False
-
-
-def _simulate_sequence(sequence: Sequence[VectorCommand], state: EncoderStateV4, palette: Sequence[str]) -> Tuple[int, EncoderStateV4, int]:
-    current = state.clone(); bits = 0; repeats = 0
-    for command in sequence:
-        writer, current, used_repeat = _best_single_or_normal(command, current, palette)
-        bits += len(writer.bits)
-        repeats += int(used_repeat)
-    return bits, current, repeats
-
-
-def _plan_primitive_representations(commands: Sequence[VectorCommand], palette: Sequence[str]) -> Tuple[List[VectorCommand], int, int]:
-    planned: List[VectorCommand] = []
-    state = EncoderStateV4()
-    primitive_selected = 0
-    vectorized_selected = 0
-    for source in commands:
-        command = quantize_command(source)
-        if command.opcode != OP_PRIMITIVE:
-            planned.append(command)
-            _bits, state, _repeats = _simulate_sequence([command], state, palette)
-            continue
-        expansion = primitive_to_vectors(command)
-        if not expansion:
-            planned.append(command)
-            _bits, state, _repeats = _simulate_sequence([command], state, palette)
-            primitive_selected += 1
-            continue
-        vectors = [quantize_command(item) for item in expansion]
-        primitive_bits, primitive_state, _ = _simulate_sequence([command], state, palette)
-        vector_bits, vector_state, _ = _simulate_sequence(vectors, state, palette)
-        # A primitive is emitted only when it is strictly smaller. Equal-size
-        # cases intentionally use generic vectors, matching the requested rule.
-        if primitive_bits < vector_bits:
-            planned.append(command)
-            state = primitive_state
-            primitive_selected += 1
-        else:
-            planned.extend(vectors)
-            state = vector_state
-            vectorized_selected += 1
-    return planned, primitive_selected, vectorized_selected
-
-
-def _command_invariant_signature(cmd: VectorCommand) -> str:
-    anchor = _primitive_anchor(cmd) if cmd.opcode == OP_PRIMITIVE else (command_points(cmd)[0] if command_points(cmd) else (0, 0))
-    shifted = quantize_command(translate_command(cmd, -int(round(anchor[0])), -int(round(anchor[1]))))
-    return json.dumps({"op": shifted.opcode, "style": shifted.style.to_json(), "geom": shifted.geom}, sort_keys=True, separators=(",", ":"))
-
-
-def _write_group_record(w: BitWriter, state: EncoderStateV4, source_distance: int, length: int,
-                        delta: Tuple[int, int], generated: Sequence[VectorCommand]) -> None:
-    w.bits_n(REC_GROUP_REPEAT, 2)
-    w.ue(length - 2)
-    adjacent = source_distance == length
-    w.bit(adjacent)
-    if not adjacent:
-        # A nonoverlapping source is always at least `length` commands back.
-        w.ue(source_distance - length)
-    w.rice_signed(delta[0], 2)
-    w.rice_signed(delta[1], 2)
-    _update_history(state, generated)
-
-
-def _best_group_repeat(commands: Sequence[VectorCommand], index: int, state: EncoderStateV4,
-                       palette: Sequence[str], signature_positions: Dict[str, List[int]]) -> Optional[Tuple[int, int, int, int, int]]:
-    """Return source_start, length, dx, dy, saved_bits for the best prior group."""
-    if index + 1 >= len(commands):
-        return None
-    signature = _command_invariant_signature(commands[index])
-    candidates = signature_positions.get(signature, [])
-    best: Optional[Tuple[int, int, int, int, int]] = None
-    # Search recent and nonadjacent matching starts. Capping at 256 keeps a
-    # pathological tiled drawing responsive while still being comprehensive
-    # for realistic ten-message images.
-    for source_start in reversed(candidates[-256:]):
-        if source_start + 2 > index:
-            continue
-        first_delta = geom_translation(commands[source_start], commands[index])
-        if first_delta is None:
-            continue
-        maximum = min(index - source_start, len(commands) - index)
-        length = 0
-        while length < maximum:
-            delta = geom_translation(commands[source_start + length], commands[index + length])
-            if delta != first_delta:
-                break
-            length += 1
-        if length < 2:
-            continue
-        baseline_bits, _baseline_state, _ = _simulate_sequence(commands[index:index + length], state, palette)
-        group_writer = BitWriter(); group_state = state.clone()
-        _write_group_record(group_writer, group_state, index - source_start, length, first_delta, commands[index:index + length])
-        saved = baseline_bits - len(group_writer.bits)
-        if saved > 0 and (best is None or saved > best[4] or (saved == best[4] and length > best[1])):
-            best = (source_start, length, first_delta[0], first_delta[1], saved)
-    return best
-
-
-@dataclass
-class CodecStats:
-    command_count: int
-    palette_count: int
-    bit_count: int
-    packed_bytes: int
-    base91_chars: int
-    frame_count: int
-    repeat_count: int
-    group_repeat_count: int = 0
-    primitive_count: int = 0
-    vectorized_primitive_count: int = 0
-    source_command_count: int = 0
-
-    @property
-    def fits(self) -> bool:
-        return self.frame_count <= MAX_MESSAGES
-
-
-def encode_commands(commands: Sequence[VectorCommand]) -> Tuple[bytes, int, Dict[str, int], List[str]]:
-    source = [quantize_command(command) for command in commands]
-    palette = build_palette(source)
-    planned, primitive_count, vectorized_count = _plan_primitive_representations(source, palette)
-    if len(planned) > MAX_COMMANDS:
-        raise MCIError(f"Optimized image expands to {len(planned)} commands; maximum is {MAX_COMMANDS}.")
-
-    w = BitWriter()
-    w.bits_n(PROTOCOL_VERSION, 4)
-    w.ue(len(palette) - 1)
-    for color in palette:
-        w.bits_n(rgb565(color), 16)
-        w.bits_n(alpha4(color), 4)
-    w.ue(len(planned))
-
-    state = EncoderStateV4()
-    signatures: Dict[str, List[int]] = {}
-    for position, command in enumerate(planned):
-        signatures.setdefault(_command_invariant_signature(command), []).append(position)
-
-    index = 0
-    single_repeats = 0
-    group_repeats = 0
-    copied_commands = 0
-    while index < len(planned):
-        group = _best_group_repeat(planned, index, state, palette, signatures)
-        if group is not None:
-            source_start, length, dx, dy, _saved = group
-            _write_group_record(w, state, index - source_start, length, (dx, dy), planned[index:index + length])
-            group_repeats += 1
-            copied_commands += length
-            index += length
-            continue
-        record, state, used_repeat = _best_single_or_normal(planned[index], state, palette)
-        w.bits.extend(record.bits)
-        single_repeats += int(used_repeat)
-        index += 1
-
-    metrics = {
-        "single_repeats": single_repeats,
-        "group_repeats": group_repeats,
-        "copied_commands": copied_commands,
-        "primitive_count": primitive_count,
-        "vectorized_primitive_count": vectorized_count,
-        "transport_commands": len(planned),
-        "source_commands": len(source),
-    }
-    return w.to_bytes(), len(w.bits), metrics, palette
-
-
-def decode_commands(data: bytes) -> Tuple[List[VectorCommand], List[str]]:
-    r = BitReader(data)
-    version = r.bits_n(4)
-    if version != PROTOCOL_VERSION:
-        raise MCIError(f"Unsupported MCoreIMG protocol version {version}; expected {PROTOCOL_VERSION}.")
-    palette = [from_rgb565_a4(r.bits_n(16), r.bits_n(4)) for _ in range(r.ue(MAX_PALETTE - 1) + 1)]
-    output_count = r.ue(MAX_COMMANDS)
-    point_states = {op: PointState() for op in OP_NAMES}
-    style_states: Dict[int, PaintStyle] = {}
-    recent: Dict[int, VectorCommand] = {}
-    previous_opcode: Optional[int] = None
-    result: List[VectorCommand] = []
-
-    while len(result) < output_count:
-        record_type = r.bits_n(2)
-        if record_type == REC_NORMAL:
-            same = bool(r.bit())
-            if same:
-                if previous_opcode is None: raise MCIError("Same opcode before initialization.")
-                opcode = previous_opcode
-            else:
-                opcode = r.bits_n(3)
-            if opcode not in OP_NAMES: raise MCIError("Invalid opcode.")
-            same_style = bool(r.bit())
-            if same_style:
-                if opcode not in style_states: raise MCIError("Style reuse before initialization.")
-                style = copy.deepcopy(style_states[opcode])
-            else:
-                style = read_style(r, palette); style_states[opcode] = copy.deepcopy(style)
-            command = VectorCommand(opcode, style, read_geometry(r, opcode, point_states[opcode], palette))
-            validate_command(command)
-            generated = [command]
-        elif record_type == REC_SINGLE_REPEAT:
-            opcode = r.bits_n(3)
-            if opcode not in recent: raise MCIError("Repeat references missing opcode history.")
-            command = quantize_command(translate_command(recent[opcode], r.rice_signed(2, 719), r.rice_signed(2, 479)))
-            generated = [command]
-        elif record_type == REC_GROUP_REPEAT:
-            length = r.ue(MAX_COMMANDS - 2) + 2
-            adjacent = bool(r.bit())
-            distance = length if adjacent else length + r.ue(MAX_COMMANDS - length)
-            dx, dy = r.rice_signed(2, 719), r.rice_signed(2, 479)
-            source_start = len(result) - distance
-            if source_start < 0 or source_start + length > len(result):
-                raise MCIError("Group-copy reference is outside decoded history.")
-            generated = [quantize_command(translate_command(result[source_start + offset], dx, dy)) for offset in range(length)]
-            if len(result) + len(generated) > output_count:
-                raise MCIError("Group-copy expands beyond declared command count.")
-        else:
-            raise MCIError("Reserved record type encountered.")
-
-        result.extend(generated)
-        for command in generated:
-            recent[command.opcode] = command.clone()
-            previous_opcode = command.opcode
-    return result, palette
-
-
-def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
-    bit_bytes, bit_count, metrics, palette = encode_commands(commands)
-    raw = bit_bytes + zlib.crc32(bit_bytes).to_bytes(4, "big")
-    payload = base91_encode(raw)
-    image_id = enc62(zlib.crc32(raw) % (62 ** 3), 3)
-    chunks = [payload[i:i + FRAME_PAYLOAD_LEN] for i in range(0, len(payload), FRAME_PAYLOAD_LEN)] or [""]
-    total = len(chunks)
-    frames = []
-    for index, chunk in enumerate(chunks):
-        header = FRAME_MAGIC + enc62(PROTOCOL_VERSION, 1) + image_id + enc62(index, 1) + enc62(total, 1) + enc62(len(chunk), 2) + enc62(frame_crc(chunk), 3) + "0"
-        frames.append(header + chunk)
-    stats = CodecStats(
-        metrics["transport_commands"], len(palette), bit_count, len(raw), len(payload), total,
-        metrics["single_repeats"] + metrics["group_repeats"], metrics["group_repeats"],
-        metrics["primitive_count"], metrics["vectorized_primitive_count"], metrics["source_commands"],
-    )
-    return EncodedImage(raw, payload, frames, stats, image_id, palette)
-
-
-
-# ---------------------------------------------------------------------------
-# ACTIVE PROTOCOL-V5 OVERRIDE: local-space SVG groups
-# ---------------------------------------------------------------------------
-#
-# The definitions in this section are the active transport implementation.
-# In particular, the later CodecStats, encode_commands, decode_commands, and
-# encode_image replace same-named hybrid-foundation versions above.
-#
-# Local-space grouping solves a subtle vector-format problem: if every SVG
-# point is baked into canvas coordinates before compression, shrinking an SVG
-# produces numerically smaller deltas and falsely appears to compress better.
-# This layer instead normalizes geometry once and sends a fixed-width display
-# box. Display scale therefore does not determine geometry cost.
-# Imported SVGs are encoded once in a stable local coordinate space. Their
-# displayed position and size are carried in a fixed-width transform box.
-# Consequently, dragging or scaling an SVG does not make its path coordinates
-# cheaper or more expensive, and repeated SVGs can reuse the same definition.
-PROTOCOL_VERSION = 5
-SOURCE_VERSION = 5
-CONSTRUCTOR_BUILD = "2026.08.02-svg-v5.1-DOCUMENTED-LOCALSPACE-HYBRID-10MSG"
-
-REC_TRANSFORM_GROUP = REC_RESERVED
-LOCAL_GROUP_EXTENT = 255
-
-
-@dataclass
-class _TransformGroupPlan:
-    """Encoder plan for one contiguous imported-SVG command run.
-
-    ``start:end`` indexes the transport-planned display command list.
-    ``local_commands`` are normalized and scale-independent.
-    ``display_commands`` are the quantized reconstruction used for history and
-    preview parity. ``signature`` identifies reusable local definitions and
-    deliberately excludes x/y/display width/display height.
-    """
-
-    start: int
-    end: int
-    local_commands: List[VectorCommand]
-    display_commands: List[VectorCommand]
-    x: int
-    y: int
-    width: int
-    height: int
-    local_width: int
-    local_height: int
-    signature: str
-
-
-@dataclass
-class _DecoderStateV5:
-    """Mutable decode/encode history shared by normal and repeat records.
-
-    Point and style state are opcode-local. ``recent`` stores the latest fully
-    reconstructed command for each opcode. ``previous_opcode`` supports the
-    one-bit same-opcode shortcut used by normal records.
-    """
-
-    point_states: Dict[int, PointState] = field(default_factory=lambda: {op: PointState() for op in OP_NAMES})
-    style_states: Dict[int, PaintStyle] = field(default_factory=dict)
-    recent: Dict[int, VectorCommand] = field(default_factory=dict)
-    previous_opcode: Optional[int] = None
-
-
-def _all_transport_points_v5(command: VectorCommand) -> List[Tuple[float, float]]:
-    """Return every coordinate that the bitstream must carry, including Bézier controls."""
-    g = command.geom
-    if command.opcode == OP_PATH:
-        return [tuple(point) for segment in g.get("segments", []) for point in segment.get("points", [])]
-    if command.opcode == OP_RECT:
-        x, y, width, height = float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"])
-        return [(x, y), (x + width, y + height)]
-    if command.opcode == OP_ELLIPSE:
-        cx, cy, rx, ry = float(g["cx"]), float(g["cy"]), float(g["rx"]), float(g["ry"])
-        return [(cx - rx, cy - ry), (cx + rx, cy + ry)]
-    return [tuple(point) for point in command_points(command)]
-
-
-def _geometry_bbox_v5(commands: Sequence[VectorCommand]) -> Tuple[float, float, float, float]:
-    """Bounds for normalization, including path control points.
-
-    This differs from visual bounds. Control points must be included because
-    they are encoded and must remain inside the advertised local coordinate
-    box even when a Bézier curve never reaches the control point itself.
-    """
-    points = [point for command in commands for point in _all_transport_points_v5(command)]
-    if not points:
-        return 0.0, 0.0, 0.0, 0.0
-    xs = [point[0] for point in points]
-    ys = [point[1] for point in points]
-    return min(xs), min(ys), max(xs), max(ys)
-
-
-def _group_transport_signature_v5(commands: Sequence[VectorCommand], local_width: int, local_height: int) -> str:
-    """Create a deterministic identity for reusable local geometry.
-
-    Placement is intentionally absent. Two copies at different positions or
-    display sizes should share one definition when their normalized commands,
-    styles, and local dimensions match.
-    """
-    payload = {
-        "w": int(local_width),
-        "h": int(local_height),
-        "commands": [
-            {
-                "opcode": command.opcode,
-                "style": command.style.normalized().to_json(),
-                "geom": command.geom,
-            }
-            for command in commands
-        ],
-    }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def _make_transform_group_v5(commands: Sequence[VectorCommand], start: int, end: int) -> Optional[_TransformGroupPlan]:
-    """Normalize one eligible contiguous command run into local coordinates.
-
-    Returns ``None`` for runs that are too short, contain compact primitives,
-    or have degenerate width/height. The caller may then encode those commands
-    using normal/repeat records. This function performs lossy integer
-    quantization at the selected local extent; preview parity depends on using
-    ``display_commands`` reconstructed from the same quantized definition.
-    """
-    group = [command.clone() for command in commands[start:end]]
-    if len(group) < 2 or any(command.opcode == OP_PRIMITIVE for command in group):
-        return None
-    x1, y1, x2, y2 = _geometry_bbox_v5(group)
-    raw_width = x2 - x1
-    raw_height = y2 - y1
-    if raw_width <= 1e-6 or raw_height <= 1e-6:
-        return None
-    maximum = max(raw_width, raw_height)
-    local_width = max(1, min(LOCAL_GROUP_EXTENT, int(round(raw_width / maximum * LOCAL_GROUP_EXTENT))))
-    local_height = max(1, min(LOCAL_GROUP_EXTENT, int(round(raw_height / maximum * LOCAL_GROUP_EXTENT))))
-    normalize = mat_mul(
-        mat_scale(local_width / raw_width, local_height / raw_height),
-        mat_translate(-x1, -y1),
-    )
-    local_commands: List[VectorCommand] = []
-    for command in group:
-        local = quantize_command(transform_command(command, normalize))
-        local.editor_group = None
-        local_commands.append(local)
-    # Integer quantization can push an endpoint one unit beyond the nominal
-    # normalized extent (for example, rounded x plus rounded width). Advertise
-    # the actual local coordinate envelope so the nested point codec and the
-    # inverse transform agree exactly.
-    local_points = [point for command in local_commands for point in _all_transport_points_v5(command)]
-    if local_points:
-        local_width = max(local_width, min(256, int(math.ceil(max(point[0] for point in local_points)))))
-        local_height = max(local_height, min(256, int(math.ceil(max(point[1] for point in local_points)))))
-
-    # The placement fields are fixed-width, so changing them does not change
-    # the transmission length. The local definition above remains stable as
-    # the SVG is resized.
-    x = max(0, min(CANVAS_W - 1, int(round(x1))))
-    y = max(0, min(CANVAS_H - 1, int(round(y1))))
-    width = max(1, min(CANVAS_W, int(round(raw_width))))
-    height = max(1, min(CANVAS_H, int(round(raw_height))))
-    if x + width > CANVAS_W:
-        width = CANVAS_W - x
-    if y + height > CANVAS_H:
-        height = CANVAS_H - y
-
-    display_commands = _apply_transform_group_v5(
-        local_commands, x, y, width, height, local_width, local_height,
-    )
-    signature = _group_transport_signature_v5(local_commands, local_width, local_height)
-    return _TransformGroupPlan(
-        start, end, local_commands, display_commands,
-        x, y, width, height, local_width, local_height, signature,
-    )
-
-
-def _apply_transform_group_v5(
-    local_commands: Sequence[VectorCommand],
-    x: int,
-    y: int,
-    width: int,
-    height: int,
-    local_width: int,
-    local_height: int,
-) -> List[VectorCommand]:
-    matrix = mat_mul(
-        mat_translate(x, y),
-        mat_scale(width / max(1, local_width), height / max(1, local_height)),
-    )
-    output: List[VectorCommand] = []
-    for command in local_commands:
-        restored = quantize_command(transform_command(command, matrix))
-        restored.editor_group = None
-        output.append(restored)
-    return output
-
-
-def _write_transform_box_v5(w: BitWriter, plan: _TransformGroupPlan) -> None:
-    """Write fixed-width display and local-box dimensions.
-
-    Fixed width is intentional: moving or resizing a group changes values but
-    not field length. Canvas dimensions explain the 10/9-bit x/y and width/
-    height fields; local dimensions fit in eight bits.
-    """
-    w.bits_n(plan.x, 10)
-    w.bits_n(plan.y, 9)
-    w.bits_n(plan.width - 1, 10)
-    w.bits_n(plan.height - 1, 9)
-    w.bits_n(plan.local_width - 1, 8)
-    w.bits_n(plan.local_height - 1, 8)
-
-
-def _read_transform_box_v5(r: BitReader) -> Tuple[int, int, int, int, int, int]:
-    """Read and validate a transform box before allocating/expanding geometry."""
-    x = r.bits_n(10)
-    y = r.bits_n(9)
-    width = r.bits_n(10) + 1
-    height = r.bits_n(9) + 1
-    local_width = r.bits_n(8) + 1
-    local_height = r.bits_n(8) + 1
-    if x >= CANVAS_W or y >= CANVAS_H or x + width > CANVAS_W or y + height > CANVAS_H:
-        raise MCIError("Transformed SVG group lies outside the canvas.")
-    return x, y, width, height, local_width, local_height
-
-
-def _local_bits_v5(maximum: int) -> int:
-    return max(1, int(maximum).bit_length())
-
-
-def _write_local_point_v5(
-    w: BitWriter, state: PointState, point: Tuple[int, int], local_width: int, local_height: int,
-) -> None:
-    """Write one local point using the cheaper absolute or Rice-delta form.
-
-    Unlike canvas points, the absolute bit width derives from the group's local
-    dimensions. Delta state remains opcode-local through the nested decoder
-    state used for the definition.
-    """
-    x, y = int(point[0]), int(point[1])
-    x_bits = _local_bits_v5(local_width)
-    y_bits = _local_bits_v5(local_height)
-    absolute_bits = 1 + x_bits + y_bits
-    delta_bits = 1 + rice_signed_length(x - state.x, 3) + rice_signed_length(y - state.y, 3) if state.initialized else 10**9
-    use_delta = state.initialized and delta_bits <= absolute_bits
-    w.bit(use_delta)
-    if use_delta:
-        w.rice_signed(x - state.x, 3)
-        w.rice_signed(y - state.y, 3)
-    else:
-        w.bits_n(x, x_bits)
-        w.bits_n(y, y_bits)
-    state.initialized = True
-    state.x, state.y = x, y
-
-
-def _read_local_point_v5(
-    r: BitReader, state: PointState, local_width: int, local_height: int,
-) -> Tuple[int, int]:
-    """Inverse of _write_local_point_v5 with strict local-box validation."""
-    if r.bit():
-        if not state.initialized:
-            raise MCIError("Local delta point before initialization.")
-        x = state.x + r.rice_signed(3, 1024)
-        y = state.y + r.rice_signed(3, 1024)
-    else:
-        x = r.bits_n(_local_bits_v5(local_width))
-        y = r.bits_n(_local_bits_v5(local_height))
-    if not (0 <= x <= local_width and 0 <= y <= local_height):
-        raise MCIError(f"Point outside local SVG group: {x},{y}.")
-    state.initialized = True
-    state.x, state.y = x, y
-    return x, y
-
-
-def _write_local_geometry_v5(
-    w: BitWriter, command: VectorCommand, state: PointState, local_width: int, local_height: int,
-) -> None:
-    """Write generic vector geometry inside a local SVG definition.
-
-    Compact primitives are excluded before this function. Keeping local
-    definitions generic makes their signatures deterministic and lets the same
-    geometry be instantiated at several display sizes.
-    """
-    g = command.geom
-    point = lambda value: _write_local_point_v5(w, state, tuple(value), local_width, local_height)
-    if command.opcode == OP_RECT:
-        point((int(g["x"]), int(g["y"])))
-        w.ue(int(g["w"]) - 1); w.ue(int(g["h"]) - 1)
-    elif command.opcode == OP_ELLIPSE:
-        point((int(g["cx"]), int(g["cy"])))
-        w.ue(int(g["rx"]) - 1); w.ue(int(g["ry"]) - 1)
-    elif command.opcode == OP_LINE:
-        point(g["p1"]); point(g["p2"])
-    elif command.opcode in {OP_POLYLINE, OP_POLYGON}:
-        points = [tuple(value) for value in g["points"]]
-        minimum = 2 if command.opcode == OP_POLYLINE else 3
-        w.ue(len(points) - minimum)
-        for value in points:
-            point(value)
-    elif command.opcode == OP_PATH:
-        segments = g["segments"]
-        w.ue(len(segments) - 1)
-        for segment in segments:
-            w.bits_n(int(segment["op"]), 3)
-            for value in segment.get("points", []):
-                point(value)
-    else:
-        raise MCIError("Local SVG groups support generic vector commands only.")
-
-
-def _read_local_geometry_v5(
-    r: BitReader, opcode: int, state: PointState, local_width: int, local_height: int,
-) -> Dict[str, Any]:
-    point = lambda: _read_local_point_v5(r, state, local_width, local_height)
-    if opcode == OP_RECT:
-        x, y = point(); return {"x": x, "y": y, "w": r.ue(1023) + 1, "h": r.ue(1023) + 1}
-    if opcode == OP_ELLIPSE:
-        cx, cy = point(); return {"cx": cx, "cy": cy, "rx": r.ue(1023) + 1, "ry": r.ue(1023) + 1}
-    if opcode == OP_LINE:
-        return {"p1": point(), "p2": point()}
-    if opcode in {OP_POLYLINE, OP_POLYGON}:
-        minimum = 2 if opcode == OP_POLYLINE else 3
-        count = r.ue(MAX_COMMANDS) + minimum
-        return {"points": [point() for _ in range(count)]}
-    if opcode == OP_PATH:
-        count = r.ue(MAX_COMMANDS * 8) + 1
-        point_counts = {SEG_M: 1, SEG_L: 1, SEG_Q: 2, SEG_C: 3, SEG_Z: 0}
-        segments = []
-        for _ in range(count):
-            operation = r.bits_n(3)
-            if operation not in point_counts:
-                raise MCIError("Invalid local path segment opcode.")
-            segments.append({"op": operation, "points": [point() for _ in range(point_counts[operation])]})
-        return {"segments": segments}
-    raise MCIError("Invalid local SVG opcode.")
-
-
-def _write_local_normal_record_v5(
-    w: BitWriter,
-    state: EncoderStateV4,
-    command: VectorCommand,
-    palette: Sequence[str],
-    local_width: int,
-    local_height: int,
-) -> None:
-    w.bits_n(REC_NORMAL, 2)
-    same_opcode = state.previous_opcode == command.opcode
-    w.bit(same_opcode)
-    if not same_opcode:
-        w.bits_n(command.opcode, 3)
-    key = style_key(command.style, palette)
-    same_style = state.style_states.get(command.opcode) == key
-    w.bit(same_style)
-    if not same_style:
-        write_style(w, command.style, palette)
-        state.style_states[command.opcode] = key
-    _write_local_geometry_v5(
-        w, command, state.point_states[command.opcode], local_width, local_height,
-    )
-    _update_history(state, [command])
-
-
-def _best_local_record_v5(
-    command: VectorCommand,
-    state: EncoderStateV4,
-    palette: Sequence[str],
-    local_width: int,
-    local_height: int,
-) -> Tuple[BitWriter, EncoderStateV4]:
-    normal = BitWriter(); normal_state = state.clone()
-    _write_local_normal_record_v5(
-        normal, normal_state, command, palette, local_width, local_height,
-    )
-    reference = state.recent.get(command.opcode)
-    delta = geom_translation(reference, command) if reference is not None else None
-    if delta is None:
-        return normal, normal_state
-    repeated = BitWriter(); repeated_state = state.clone()
-    _write_single_repeat_record(repeated, repeated_state, command, delta)
-    if len(repeated.bits) < len(normal.bits):
-        return repeated, repeated_state
-    return normal, normal_state
-
-
-def _write_local_definition_v5(
-    w: BitWriter,
-    commands: Sequence[VectorCommand],
-    palette: Sequence[str],
-    local_width: int,
-    local_height: int,
-) -> None:
-    state = EncoderStateV4()
-    for command in commands:
-        record, state = _best_local_record_v5(
-            command, state, palette, local_width, local_height,
-        )
-        w.bits.extend(record.bits)
-
-def _decode_regular_record_v5(r: BitReader, palette: Sequence[str], state: _DecoderStateV5, local_width: int, local_height: int) -> VectorCommand:
-    record_type = r.bits_n(2)
-    if record_type == REC_NORMAL:
-        same = bool(r.bit())
-        if same:
-            if state.previous_opcode is None:
-                raise MCIError("Same opcode before initialization.")
-            opcode = state.previous_opcode
-        else:
-            opcode = r.bits_n(3)
-        if opcode not in OP_NAMES:
-            raise MCIError("Invalid opcode.")
-        same_style = bool(r.bit())
-        if same_style:
-            if opcode not in state.style_states:
-                raise MCIError("Style reuse before initialization.")
-            style = copy.deepcopy(state.style_states[opcode])
-        else:
-            style = read_style(r, palette)
-            state.style_states[opcode] = copy.deepcopy(style)
-        command = VectorCommand(opcode, style, _read_local_geometry_v5(r, opcode, state.point_states[opcode], local_width, local_height))
-        validate_command(command)
-    elif record_type == REC_SINGLE_REPEAT:
-        opcode = r.bits_n(3)
-        if opcode not in state.recent:
-            raise MCIError("Repeat references missing opcode history.")
-        command = quantize_command(
-            translate_command(state.recent[opcode], r.rice_signed(2, 719), r.rice_signed(2, 479))
-        )
-    else:
-        raise MCIError("A local SVG definition may contain only normal or single-repeat records.")
-    state.recent[command.opcode] = command.clone()
-    state.previous_opcode = command.opcode
-    return command
-
-
-def _plan_primitive_representations_v5(
-    commands: Sequence[VectorCommand], palette: Sequence[str],
-) -> Tuple[List[VectorCommand], int, int]:
-    """Keep generic SVG geometry unquantized until local-space normalization."""
-    planned: List[VectorCommand] = []
-    comparison_state = EncoderStateV4()
-    primitive_selected = 0
-    vectorized_selected = 0
-    for source in commands:
-        quantized = quantize_command(source)
-        if source.opcode != OP_PRIMITIVE:
-            planned.append(source.clone())
-            _bits, comparison_state, _repeats = _simulate_sequence([quantized], comparison_state, palette)
-            continue
-        expansion = primitive_to_vectors(quantized)
-        if not expansion:
-            planned.append(quantized)
-            _bits, comparison_state, _repeats = _simulate_sequence([quantized], comparison_state, palette)
-            primitive_selected += 1
-            continue
-        vectors = [quantize_command(item) for item in expansion]
-        primitive_bits, primitive_state, _ = _simulate_sequence([quantized], comparison_state, palette)
-        vector_bits, vector_state, _ = _simulate_sequence(vectors, comparison_state, palette)
-        if primitive_bits < vector_bits:
-            planned.append(quantized)
-            comparison_state = primitive_state
-            primitive_selected += 1
-        else:
-            for vector in vectors:
-                vector.editor_group = None
-            planned.extend(vectors)
-            comparison_state = vector_state
-            vectorized_selected += 1
-    return planned, primitive_selected, vectorized_selected
-
-
-@dataclass
-class CodecStats:
-    command_count: int
-    palette_count: int
-    bit_count: int
-    packed_bytes: int
-    base91_chars: int
-    frame_count: int
-    repeat_count: int
-    group_repeat_count: int = 0
-    primitive_count: int = 0
-    vectorized_primitive_count: int = 0
-    source_command_count: int = 0
-    transformed_group_count: int = 0
-    transformed_group_reference_count: int = 0
-    local_group_extent: int = 0
-
-    @property
-    def fits(self) -> bool:
-        return self.frame_count <= MAX_MESSAGES
-
-
-# ACTIVE V5 COMMAND ENCODER
-# -------------------------
-# This is the final encode_commands definition. It first resolves primitive
-# representations, then identifies local SVG groups, then chooses repeat/normal
-# records for everything else. Metrics returned here feed both the status bar
-# and regression tests; add new metrics in CodecStats and preview_frames too.
-
-def encode_commands(commands: Sequence[VectorCommand]) -> Tuple[bytes, int, Dict[str, int], List[str]]:
-    raw_source = [command.clone() for command in commands]
-    palette = build_palette(raw_source)
-    planned, primitive_count, vectorized_count = _plan_primitive_representations_v5(raw_source, palette)
-    if len(planned) > MAX_COMMANDS:
-        raise MCIError(f"Optimized image expands to {len(planned)} commands; maximum is {MAX_COMMANDS}.")
-
-    display_commands = [quantize_command(command) for command in planned]
-    transform_plans: Dict[int, _TransformGroupPlan] = {}
-    transform_covered: set[int] = set()
-    index = 0
-    while index < len(planned):
-        group_id = planned[index].editor_group
-        if group_id is None or planned[index].opcode == OP_PRIMITIVE:
-            index += 1
-            continue
-        end = index + 1
-        while end < len(planned) and planned[end].editor_group == group_id and planned[end].opcode != OP_PRIMITIVE:
-            end += 1
-        plan = _make_transform_group_v5(planned, index, end)
-        if plan is not None:
-            transform_plans[index] = plan
-            transform_covered.update(range(index, end))
-            display_commands[index:end] = plan.display_commands
-        index = end
-
-    w = BitWriter()
-    w.bits_n(PROTOCOL_VERSION, 4)
-    w.ue(len(palette) - 1)
-    for color in palette:
-        w.bits_n(rgb565(color), 16)
-        w.bits_n(alpha4(color), 4)
-    w.ue(len(display_commands))
-
-    state = EncoderStateV4()
-    signatures: Dict[str, List[int]] = {}
-    for position, command in enumerate(display_commands):
-        signatures.setdefault(_command_invariant_signature(command), []).append(position)
-
-    definition_indices: Dict[str, int] = {}
-    definitions: List[_TransformGroupPlan] = []
-    single_repeats = 0
-    translated_group_repeats = 0
-    transformed_groups = 0
-    transformed_references = 0
-    copied_commands = 0
-    index = 0
-    while index < len(display_commands):
-        plan = transform_plans.get(index)
-        if plan is not None:
-            w.bits_n(REC_TRANSFORM_GROUP, 2)
-            definition_index = definition_indices.get(plan.signature)
-            is_reference = definition_index is not None
-            w.bit(is_reference)
-            _write_transform_box_v5(w, plan)
-            if is_reference:
-                assert definition_index is not None
-                w.ue(definition_index)
-                transformed_references += 1
-                copied_commands += len(plan.local_commands)
-            else:
-                w.ue(len(plan.local_commands) - 2)
-                _write_local_definition_v5(w, plan.local_commands, palette, plan.local_width, plan.local_height)
-                definition_indices[plan.signature] = len(definitions)
-                definitions.append(plan)
-            transformed_groups += 1
-            _update_history(state, plan.display_commands)
-            index = plan.end
-            continue
-
-        group = _best_group_repeat(display_commands, index, state, palette, signatures)
-        if group is not None:
-            source_start, length, dx, dy, _saved = group
-            # Do not swallow a local-space target group. Those groups must keep
-            # their scale-independent representation.
-            if any(position in transform_covered for position in range(index, index + length)):
-                group = None
-        if group is not None:
-            source_start, length, dx, dy, _saved = group
-            _write_group_record(w, state, index - source_start, length, (dx, dy), display_commands[index:index + length])
-            translated_group_repeats += 1
-            copied_commands += length
-            index += length
-            continue
-        record, state, used_repeat = _best_single_or_normal(display_commands[index], state, palette)
-        w.bits.extend(record.bits)
-        single_repeats += int(used_repeat)
-        index += 1
-
-    metrics = {
-        "single_repeats": single_repeats,
-        "group_repeats": translated_group_repeats + transformed_references,
-        "translated_group_repeats": translated_group_repeats,
-        "transformed_groups": transformed_groups,
-        "transformed_references": transformed_references,
-        "copied_commands": copied_commands,
-        "primitive_count": primitive_count,
-        "vectorized_primitive_count": vectorized_count,
-        "transport_commands": len(display_commands),
-        "source_commands": len(raw_source),
-    }
-    return w.to_bytes(), len(w.bits), metrics, palette
-
-
-# ACTIVE V5 COMMAND DECODER
-# -------------------------
-# Decoder record expansion must update history exactly as if the expanded
-# commands had arrived as normal records. Repeat/reference bugs often appear
-# only in a later command because stale opcode/style/point history survives.
-
-def decode_commands(data: bytes) -> Tuple[List[VectorCommand], List[str]]:
-    r = BitReader(data)
-    version = r.bits_n(4)
-    if version != PROTOCOL_VERSION:
-        raise MCIError(f"Unsupported MCoreIMG protocol version {version}; expected {PROTOCOL_VERSION}.")
-    palette = [from_rgb565_a4(r.bits_n(16), r.bits_n(4)) for _ in range(r.ue(MAX_PALETTE - 1) + 1)]
-    output_count = r.ue(MAX_COMMANDS)
-    state = _DecoderStateV5()
-    result: List[VectorCommand] = []
-    definitions: List[Tuple[List[VectorCommand], int, int]] = []
-
-    while len(result) < output_count:
-        record_type = r.bits_n(2)
-        if record_type == REC_NORMAL:
-            # The helper expects to consume the record type itself. Recreate a
-            # tiny reader prefix by decoding this normal record inline.
-            same = bool(r.bit())
-            if same:
-                if state.previous_opcode is None:
-                    raise MCIError("Same opcode before initialization.")
-                opcode = state.previous_opcode
-            else:
-                opcode = r.bits_n(3)
-            if opcode not in OP_NAMES:
-                raise MCIError("Invalid opcode.")
-            same_style = bool(r.bit())
-            if same_style:
-                if opcode not in state.style_states:
-                    raise MCIError("Style reuse before initialization.")
-                style = copy.deepcopy(state.style_states[opcode])
-            else:
-                style = read_style(r, palette)
-                state.style_states[opcode] = copy.deepcopy(style)
-            command = VectorCommand(opcode, style, read_geometry(r, opcode, state.point_states[opcode], palette))
-            validate_command(command)
-            generated = [command]
-        elif record_type == REC_SINGLE_REPEAT:
-            opcode = r.bits_n(3)
-            if opcode not in state.recent:
-                raise MCIError("Repeat references missing opcode history.")
-            command = quantize_command(
-                translate_command(state.recent[opcode], r.rice_signed(2, 719), r.rice_signed(2, 479))
-            )
-            generated = [command]
-        elif record_type == REC_GROUP_REPEAT:
-            length = r.ue(MAX_COMMANDS - 2) + 2
-            adjacent = bool(r.bit())
-            distance = length if adjacent else length + r.ue(MAX_COMMANDS - length)
-            dx, dy = r.rice_signed(2, 719), r.rice_signed(2, 479)
-            source_start = len(result) - distance
-            if source_start < 0 or source_start + length > len(result):
-                raise MCIError("Group-copy reference is outside decoded history.")
-            generated = [
-                quantize_command(translate_command(result[source_start + offset], dx, dy))
-                for offset in range(length)
-            ]
-        elif record_type == REC_TRANSFORM_GROUP:
-            is_reference = bool(r.bit())
-            x, y, width, height, local_width, local_height = _read_transform_box_v5(r)
-            if is_reference:
-                definition_index = r.ue(MAX_COMMANDS)
-                if definition_index >= len(definitions):
-                    raise MCIError("SVG group references an undefined local definition.")
-                local_commands, saved_local_width, saved_local_height = definitions[definition_index]
-                if local_width != saved_local_width or local_height != saved_local_height:
-                    raise MCIError("SVG group reference has mismatched local dimensions.")
-            else:
-                length = r.ue(MAX_COMMANDS - 2) + 2
-                nested_state = _DecoderStateV5()
-                local_commands = [
-                    _decode_regular_record_v5(r, palette, nested_state, local_width, local_height)
-                    for _ in range(length)
-                ]
-                definitions.append((copy.deepcopy(local_commands), local_width, local_height))
-            generated = _apply_transform_group_v5(
-                local_commands, x, y, width, height, local_width, local_height,
-            )
-        else:
-            raise MCIError("Invalid record type.")
-
-        if len(result) + len(generated) > output_count:
-            raise MCIError("Record expands beyond declared command count.")
-        result.extend(generated)
-        for command in generated:
-            state.recent[command.opcode] = command.clone()
-            state.previous_opcode = command.opcode
-    return result, palette
-
-
-def _encode_image_once_v5(commands: Sequence[VectorCommand], local_extent: int) -> EncodedImage:
-    """Encode once using a particular local-coordinate precision.
-
-    TODO(DEBT): this temporarily mutates LOCAL_GROUP_EXTENT. The application is
-    currently single-threaded, but an explicit CodecConfig should replace this
-    global before the codec is reused concurrently or as a library service.
-    """
-    global LOCAL_GROUP_EXTENT
-    previous_extent = LOCAL_GROUP_EXTENT
-    LOCAL_GROUP_EXTENT = int(local_extent)
-    try:
-        bit_bytes, bit_count, metrics, palette = encode_commands(commands)
-    finally:
-        LOCAL_GROUP_EXTENT = previous_extent
-    raw = bit_bytes + zlib.crc32(bit_bytes).to_bytes(4, "big")
-    payload = base91_encode(raw)
-    image_id = enc62(zlib.crc32(raw) % (62 ** 3), 3)
-    chunks = [payload[i:i + FRAME_PAYLOAD_LEN] for i in range(0, len(payload), FRAME_PAYLOAD_LEN)] or [""]
-    total = len(chunks)
-    frames = []
-    for index, chunk in enumerate(chunks):
-        header = FRAME_MAGIC + enc62(PROTOCOL_VERSION, 1) + image_id + enc62(index, 1) + enc62(total, 1) + enc62(len(chunk), 2) + enc62(frame_crc(chunk), 3) + "0"
-        frames.append(header + chunk)
-    stats = CodecStats(
-        metrics["transport_commands"], len(palette), bit_count, len(raw), len(payload), total,
-        metrics["single_repeats"] + metrics["group_repeats"], metrics["group_repeats"],
-        metrics["primitive_count"], metrics["vectorized_primitive_count"], metrics["source_commands"],
-        metrics["transformed_groups"], metrics["transformed_references"], int(local_extent),
-    )
-    return EncodedImage(raw, payload, frames, stats, image_id, palette)
-
-
-def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
-    """Encode with the highest local-space precision that fits ten messages.
-
-    Images without eligible local groups take the direct path. For local SVG
-    groups, the precision ladder trades coordinate fidelity for payload size.
-    The first fitting candidate wins; if none fit, the smallest/last candidate
-    is returned so the GUI can report an honest over-limit result.
-    """
-    # Keep as much local-coordinate precision as the ten-message budget allows.
-    # The chosen precision depends on geometry complexity, never on displayed
-    # scale, so resizing the same SVG leaves its payload and frame count stable.
-    has_transform_group = False
-    previous_group: Optional[int] = None
-    group_run = 0
-    for command in commands:
-        if command.editor_group is not None and command.opcode != OP_PRIMITIVE:
-            if command.editor_group == previous_group:
-                group_run += 1
-            else:
-                previous_group = command.editor_group
-                group_run = 1
-            if group_run >= 2:
-                has_transform_group = True
-                break
-        else:
-            previous_group = None
-            group_run = 0
-
-    if not has_transform_group:
-        return _encode_image_once_v5(commands, LOCAL_GROUP_EXTENT)
-
-    precision_ladder = (255, 224, 192, 160, 144, 128, 112, 96, 80, 72, 64, 56, 48, 40, 32)
-    smallest: Optional[EncodedImage] = None
-    for extent in precision_ladder:
-        candidate = _encode_image_once_v5(commands, extent)
-        smallest = candidate
-        if candidate.stats.fits:
-            return candidate
-    assert smallest is not None
-    return smallest
-
-# ---- Multi-SVG composition helpers ----------------------------------------
-
-
-def next_editor_group(doc: VectorDocument) -> int:
-    groups = [int(command.editor_group) for command in doc.commands if command.editor_group is not None]
-    return max(groups, default=0) + 1
-
-
-def assign_editor_group(commands: Sequence[VectorCommand], group_id: int) -> None:
-    for command in commands:
-        command.editor_group = int(group_id)
-
-
-def preserve_alpha_with_rgb(old_color: Optional[str], new_rgb: str) -> str:
-    rgb = normalize_hex(new_rgb)[:7]
-    if old_color:
-        normalized = normalize_hex(old_color)
-        if len(normalized) == 9:
-            return rgb + normalized[7:9]
-    return rgb
-
-
-def append_source_files(
-    target: VectorDocument,
-    paths: Sequence[str | Path],
-    base_dx: int = 0,
-    base_dy: int = 0,
-    step_dx: int = 40,
-    step_dy: int = 40,
-) -> Tuple[int, int]:
-    """Append one or more SVG/source documents without replacing current art.
-
-    Existing document transforms are baked first so newly appended artwork and
-    click-drawn primitives share the same canvas coordinate system.  Each file
-    is imported using its own SVG fit-to-canvas transform, then translated by
-    ``base + index * step``. Re-importing the same SVG therefore produces an
-    exact translated command group that protocol-v5 local-definition reuse can
-    reference instead of transmitting twice.
-    """
-    normalized_paths = [Path(item) for item in paths]
-    if not normalized_paths:
-        return 0, 0
-
-    if target.commands and (
-        abs(target.scale - 1.0) > 1e-9
-        or abs(target.offset_x) > 1e-9
-        or abs(target.offset_y) > 1e-9
-    ):
-        target.bake_transform()
-
-    appended_commands = 0
-    appended_files = 0
-    for index, path in enumerate(normalized_paths):
-        incoming = load_source(path)
-        incoming_commands = incoming.transformed_commands()
-        dx = int(base_dx) + index * int(step_dx)
-        dy = int(base_dy) + index * int(step_dy)
-        prefix = path.stem
-        group_id = next_editor_group(target)
-        for command in incoming_commands:
-            copied = translate_command(command, dx, dy)
-            copied.label = f"{prefix} #{index + 1} | {copied.label}"
-            copied.editor_group = group_id
-            target.commands.append(copied)
-        for warning in incoming.warnings:
-            target.warnings.append(f"{path.name}: {warning}")
-        appended_commands += len(incoming_commands)
-        appended_files += 1
-    return appended_files, appended_commands
-
-
-class MultiSVGPlacementDialog(tk.Toplevel):
-    """One compact placement dialog for a multi-file SVG append operation."""
-
-    def __init__(self, parent: tk.Misc, file_count: int):
-        super().__init__(parent)
-        self.title(f"Add {file_count} SVG file{'s' if file_count != 1 else ''}")
-        self.resizable(False, False)
-        self.transient(parent)
-        self.grab_set()
-        self.result: Optional[Tuple[int, int, int, int]] = None
-
-        self.base_x = tk.IntVar(value=0)
-        self.base_y = tk.IntVar(value=0)
-        self.step_x = tk.IntVar(value=40 if file_count > 1 else 0)
-        self.step_y = tk.IntVar(value=40 if file_count > 1 else 0)
-
-        frame = ttk.Frame(self, padding=12)
-        frame.pack(fill="both", expand=True)
-        ttk.Label(
-            frame,
-            text=("The first SVG keeps its fitted canvas position. Each later "
-                  "SVG receives the additional step offset. Selecting the same "
-                  "SVG repeatedly enables translated group-copy compression."),
-            wraplength=390,
-        ).grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
-
-        fields = [
-            ("Base X", self.base_x, "Base Y", self.base_y),
-            ("Per-file step X", self.step_x, "Per-file step Y", self.step_y),
-        ]
-        for row, (left_label, left_var, right_label, right_var) in enumerate(fields, start=1):
-            ttk.Label(frame, text=left_label).grid(row=row, column=0, sticky="w", padx=(0, 4), pady=3)
-            ttk.Spinbox(frame, from_=-1440, to=1440, textvariable=left_var, width=9).grid(row=row, column=1, sticky="w", pady=3)
-            ttk.Label(frame, text=right_label).grid(row=row, column=2, sticky="w", padx=(12, 4), pady=3)
-            ttk.Spinbox(frame, from_=-960, to=960, textvariable=right_var, width=9).grid(row=row, column=3, sticky="w", pady=3)
-
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=0, columnspan=4, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Cancel", command=self._cancel).pack(side="right", padx=(6, 0))
-        ttk.Button(buttons, text="Add SVG(s)", command=self._accept).pack(side="right")
-        self.bind("<Return>", lambda _event: self._accept())
-        self.bind("<Escape>", lambda _event: self._cancel())
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.update_idletasks()
-        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_reqwidth()) // 2)
-        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
-        self.geometry(f"+{x}+{y}")
-        self.wait_visibility()
-        self.focus_set()
-        self.wait_window(self)
-
-    def _accept(self) -> None:
-        try:
-            self.result = (
-                int(self.base_x.get()), int(self.base_y.get()),
-                int(self.step_x.get()), int(self.step_y.get()),
-            )
-        except (ValueError, tk.TclError):
-            messagebox.showerror("Invalid placement", "Placement values must be whole numbers.", parent=self)
-            return
-        self.grab_release()
-        self.destroy()
-
-    def _cancel(self) -> None:
-        self.result = None
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        self.destroy()
-
-
-# ---- HYBRID GUI LAYER ------------------------------------------------------
-# This first GUI subclass adds multi-SVG import and manual primitives. It is
-# not the final class instantiated by main(); the direct-editing/undo subclass
-# later in the file extends it. Keep this inheritance chain in mind when
-# changing _build_ui or methods also overridden later.
-
-
-class ConstructorApp(_BaseConstructorApp):
+class _DrawingAppBase(_DocumentAppBase):
     def __init__(self):
         self._manual_window: Optional[tk.Toplevel] = None
         self._manual_first_point: Optional[Tuple[int, int]] = None
@@ -4199,7 +1437,7 @@ class ConstructorApp(_BaseConstructorApp):
         self.layer_list.delete(0, "end")
         for index, command in enumerate(self.doc.commands):
             mark = "✓" if command.visible else "×"
-            name = PRIMITIVE_NAMES.get(_primitive_kind(command), "Primitive") if command.opcode == OP_PRIMITIVE else OP_NAMES[command.opcode]
+            name = PRIMITIVE_NAMES.get(primitive_kind(command), "Primitive") if command.opcode == OP_PRIMITIVE else OP_NAMES[command.opcode]
             self.layer_list.insert("end", f"{index:03d} {mark} {name:18s} {command.label}")
         self.warning_text.configure(state="normal"); self.warning_text.delete("1.0", "end")
         self.warning_text.insert("end", "\n".join(self.doc.warnings) if self.doc.warnings else "No import warnings.")
@@ -4405,7 +1643,7 @@ class ConstructorApp(_BaseConstructorApp):
             geom.update(x1=x1, y1=y1, x2=x2, y2=y2, percent=max(0, min(100, int(self.manual_percent.get()))))
         else:
             geom.update(x=x1, y=y1)
-        if kind == PRIM_TEXT: geom["text"] = _clean_primitive_text(self.manual_text.get())
+        if kind == PRIM_TEXT: geom["text"] = clean_primitive_text(self.manual_text.get())
         if kind in {PRIM_TRIANGLE_OUTLINE, PRIM_TRIANGLE_FILL, PRIM_ARROW, PRIM_YAGI, PRIM_DISH, PRIM_RADIO}:
             geom.update(orientation=orientation, scale=scale)
         if kind == PRIM_STAR: geom.update(radius=rx, scale=scale)
@@ -4428,19 +1666,7 @@ class ConstructorApp(_BaseConstructorApp):
             messagebox.showerror("Drawing command failed", str(exc), parent=self._manual_window)
 
 
-# ---- FINAL ACTIVE GUI LAYER: direct manipulation and undo -----------------
-# The ConstructorApp defined below is the one main() instantiates. It extends
-# the hybrid GUI rather than replacing its implementation wholesale. Method
-# lookup therefore flows: final editor -> hybrid GUI -> original base GUI.
-#
-# TODO(DEBT): collapse these layers into one class after behavior is covered by
-# UI tests. Until then, always check super() before assuming a method is local.
-
-
-_HybridConstructorApp = ConstructorApp
-
-
-class ConstructorApp(_HybridConstructorApp):
+class ConstructorApp(_DrawingAppBase):
     """Protocol-v5 hybrid Constructor with direct canvas manipulation.
 
     Editor-only grouping makes an imported SVG move and scale as one object,
@@ -4750,7 +1976,7 @@ class ConstructorApp(_HybridConstructorApp):
             messagebox.showinfo("No selection", "Select a moon primitive first.", parent=self)
             return
         command = self.doc.commands[indices[0]]
-        if command.opcode != OP_PRIMITIVE or _primitive_kind(command) != PRIM_MOON:
+        if command.opcode != OP_PRIMITIVE or primitive_kind(command) != PRIM_MOON:
             messagebox.showinfo("Not a moon", "Moon crater color applies only to the Moon primitive.", parent=self)
             return
         old = str(command.geom.get("crater_color", "#808080"))
@@ -4887,12 +2113,23 @@ class ConstructorApp(_HybridConstructorApp):
         self.selected_index = None
         self._refresh()
 
+# ==========================================================================
+# Self-test and entry point
+# ==========================================================================
+
+def sample_document()->VectorDocument:
+    return VectorDocument([
+        VectorCommand(OP_RECT,PaintStyle("#3366CC","#000000",2),{"x":30,"y":30,"w":200,"h":120},"box"),
+        VectorCommand(OP_ELLIPSE,PaintStyle("#FFCC00","#000000",2),{"cx":360,"cy":170,"rx":70,"ry":45},"oval"),
+        VectorCommand(OP_PATH,PaintStyle(None,"#CC0000",3),{"segments":[
+            {"op":SEG_M,"points":[(100,300)]},{"op":SEG_C,"points":[(180,220),(260,380),(340,300)]},
+            {"op":SEG_Q,"points":[(430,210),(520,300)]},{"op":SEG_L,"points":[(620,350)]},
+        ]},"curve"),
+        VectorCommand(OP_RECT,PaintStyle("#3366CC","#000000",2),{"x":50,"y":50,"w":200,"h":120},"translated box"),
+    ],source_name="self-test")
 
 
-# ---- v4 regression tests --------------------------------------------------
-
-
-def _transport_signature_v4(command: VectorCommand) -> Dict[str, Any]:
+def _transport_signature(command: VectorCommand) -> Dict[str, Any]:
     style = command.style.normalized()
     return {
         "opcode": command.opcode,
@@ -4903,12 +2140,6 @@ def _transport_signature_v4(command: VectorCommand) -> Dict[str, Any]:
         "geom": command.geom,
     }
 
-
-# FINAL ACTIVE REGRESSION SUITE
-# -----------------------------
-# Earlier run_self_test definitions belong to superseded layers. This final
-# function is the one main() invokes. Keep protocol fixtures here until the
-# code is split into modules and a conventional test package can replace it.
 
 def run_self_test():
     # Generic v5 round trip and alpha.
@@ -5025,43 +2256,80 @@ def run_self_test():
 
 
 def verify_build_integrity() -> None:
-    """Fail at startup if a stale/superseded layer became active by accident.
+    """Fail fast if the Constructor and the codec module are mismatched.
 
-    This guard exists because the file contains intentional redefinitions.
-    It does not prove protocol correctness, but it catches the recurring class
-    of packaging mistakes where an older Constructor was distributed under a
-    newer filename.
+    The single-file build used this to catch a superseded layer becoming
+    active by accident. With the codec extracted, the equivalent packaging
+    mistake is shipping this file beside an older or newer
+    MCoreIMG-compression.py, so the guard now verifies the pairing and the
+    feature set both halves are expected to provide.
     """
     required = {
-        "protocol": PROTOCOL_VERSION == 5,
-        "messages": MAX_MESSAGES == 10,
+        # Codec identity and transport profile.
+        "model loaded": getattr(mci, "model", None) is not None,
+        "model canvas": getattr(mci, "CANVAS_W", None) == 720
+                        and getattr(mci, "CANVAS_H", None) == 480,
+        "codec protocol 5": getattr(mci, "PROTOCOL_VERSION", None) == 5,
+        "codec 10-message envelope": getattr(mci, "MAX_MESSAGES", None) == 10,
+        "codec 150-char messages": getattr(mci, "MESSAGE_LEN", None) == 150,
+        # Record types the v5 transport contract requires.
+        "local-space record": hasattr(mci, "REC_TRANSFORM_GROUP"),
+        "group-copy record": hasattr(mci, "REC_GROUP_REPEAT"),
+        "single-repeat record": hasattr(mci, "REC_SINGLE_REPEAT"),
+        # Codec entry points this editor calls.
+        "codec encode_image": callable(getattr(mci, "encode_image", None)),
+        "codec decode_frames": callable(getattr(mci, "decode_frames", None)),
+        # Model and primitive support.
         "primitive opcode": OP_PRIMITIVE in OP_NAMES,
-        "local-space record": "REC_TRANSFORM_GROUP" in globals(),
-        "group-copy record": "REC_GROUP_REPEAT" in globals(),
+        "primitive expansion": callable(getattr(mci, "primitive_to_vectors", None)),
+        "alpha palette": callable(getattr(mci, "alpha4", None)),
+        # Editor features named in FEATURE_SIGNATURE.
         "undo": hasattr(ConstructorApp, "undo_last_action"),
         "multi-SVG": hasattr(ConstructorApp, "append_svg"),
         "drawing mode": hasattr(ConstructorApp, "open_drawing_mode"),
     }
     failed = [name for name, ok in required.items() if not ok]
     if failed:
-        raise RuntimeError("Build-integrity failure: " + ", ".join(failed))
+        raise RuntimeError(
+            "Build-integrity failure: " + ", ".join(failed)
+            + f"\n  Constructor build: {CONSTRUCTOR_BUILD}"
+            + f"\n  Codec build:       {getattr(mci, 'COMPRESSION_BUILD', 'unknown')}"
+            + f"\n  Model build:       {getattr(getattr(mci, 'model', None), 'MODEL_BUILD', 'unknown')}"
+        )
 
 
-def main(argv:Optional[Sequence[str]]=None)->int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point for version reporting, regression tests, or the Tk GUI."""
-    parser=argparse.ArgumentParser(description="MCoreIMG protocol-v5 local-space hybrid SVG and old drawing Constructor")
-    parser.add_argument("--self-test",action="store_true")
-    parser.add_argument("--version",action="store_true")
-    args=parser.parse_args(argv)
+    parser = argparse.ArgumentParser(
+        description="MCoreIMG protocol-v5 local-space hybrid SVG and old drawing Constructor")
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the regression suite and exit")
+    parser.add_argument("--version", action="store_true",
+                        help="print build, feature signature, and codec identity")
+    parser.add_argument("--compression", metavar="PATH",
+                        help=f"path to {COMPRESSION_FILENAME} (default: beside this file)")
+    args = parser.parse_args(argv)
+
     verify_build_integrity()
+
     if args.version:
         print(CONSTRUCTOR_BUILD)
         print(FEATURE_SIGNATURE)
         print(f"protocol={PROTOCOL_VERSION} messages={MAX_MESSAGES} source_version={SOURCE_VERSION}")
+        print(f"codec={getattr(mci, 'COMPRESSION_BUILD', 'unknown')}")
+        print(f"codec_path={getattr(mci, '__file__', 'unknown')}")
+        print(f"model={getattr(model, 'MODEL_BUILD', 'unknown')}")
+        print(f"model_path={getattr(model, '__file__', 'unknown')}")
         return 0
-    if args.self_test:run_self_test();return 0
-    app=ConstructorApp();app.mainloop();return 0
+
+    if args.self_test:
+        run_self_test()
+        return 0
+
+    app = ConstructorApp()
+    app.mainloop()
+    return 0
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     raise SystemExit(main())

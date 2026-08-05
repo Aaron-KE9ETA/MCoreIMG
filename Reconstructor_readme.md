@@ -1,72 +1,32 @@
 # MCoreIMG Reconstructor
 
-The **MCoreIMG Reconstructor** converts MCoreIMG transport frames back into a PNG image by loading the matching MCoreIMG Constructor as its codec and renderer.
+The receiving half of MCoreIMG. Turns transport frames, or an editable source
+file, back into a raster image.
 
-The current compatibility target is the **Constructor v5.1 local-space hybrid format**, including:
+> **Build:** `2026.08.05-reconstructor-v5.2-MODULAR`
+> **Depends on:** `MCoreIMG-compression.py` for decoding, `MCoreIMG-Constructor.py` for rendering
 
-- Protocol 5 transport
-- Local-space SVG groups
-- Fixed-width placement transforms
-- Hybrid SVG/vector and legacy primitive commands
-- Automatic primitive-versus-vector representation selection
-- Translated group-copy references
-- RGB565+A4 color and alpha
-- Source-over RGBA compositing
-- Up to ten 150-character MeshCore messages
-
-The reconstructor also retains best-effort compatibility with matching protocol 2, 3, and 4 Constructor builds.
+The Reconstructor contains **no codec of its own**. Decoding is done by the
+compression module and rendering by the Constructor, so the receiver can never
+drift from the transmitter.
 
 ---
 
-## Why the Constructor is required
+## How this differs from earlier builds
 
-The reconstructor does not maintain a second handwritten implementation of the MCoreIMG codec.
+Previous versions could not simply import the codec, because the Constructor was
+a single file with several historical implementation layers and no stable public
+API. To cope, this program carried roughly seven hundred lines of reflection: it
+scanned candidate files, ranked them by a feature score, searched modules and
+classes for anything resembling a decoder or renderer, and tried several calling
+conventions until one bound successfully.
 
-Instead, it imports the matching Constructor Python file and uses the Constructor's own:
+The codec is now an importable module with an explicit `__all__`. All of that
+discovery machinery is gone.
 
-- Frame decoder
-- Opcode definitions
-- Palette unpacking
-- Alpha handling
-- Primitive and SVG command models
-- Local-space group logic
-- Translated-copy reference handling
-- Drawing-order rules
-- Pillow renderer
-- CRC and transport validation
-
-This prevents the Constructor and Reconstructor from silently drifting apart as the protocol evolves.
-
-A protocol-5 image must be decoded by a Constructor that declares:
-
-```python
-PROTOCOL_VERSION = 5
-```
-
-The filename alone does not determine compatibility.
-
----
-
-## Current status
-
-| Component | Current target |
-|---|---|
-| Reconstructor build | `2026.08.02-v5.1-localspace-hybrid-sync-documented` |
-| Preferred protocol | 5 |
-| Preferred Constructor | v5.1 local-space hybrid |
-| Current source version | 5 |
-| Canvas default | 720 × 480 |
-| Transport envelope | 10 messages × 150 characters |
-| Output | PNG through Pillow |
-| Editable recovery | Best-effort `.mci.json` |
-
-Current protocol-5 feature signature:
-
-```text
-PROTO5 | LOCALSPACE | HYBRID | PRIMITIVES | GROUPCOPY | ALPHA | 10MSG
-```
-
-Older Constructor builds may still work when they expose a supported decoder and renderer and declare the same protocol as the input.
+The failure it was protecting against — a receiver paired with the wrong
+transmitter — is now caught directly by comparing protocol numbers and reporting
+every build string involved.
 
 ---
 
@@ -74,164 +34,71 @@ Older Constructor builds may still work when they expose a supported decoder and
 
 ### Required
 
-- Python 3.10 or newer recommended
-- A matching MCoreIMG Constructor Python file
-- The Python dependencies required by that Constructor
-- Pillow, normally imported and used by the Constructor renderer
+- Python 3.10 or newer
+- `MCoreIMG-compression.py` and `MCoreIMG-model.py` for decoding
+- `MCoreIMG-Constructor.py` and Pillow for rendering
 
 ### Optional
 
-- Tkinter, for the graphical input-file chooser
-- `xdg-open`, `open`, or the Windows shell, for opening the completed PNG automatically
+- Tkinter/Tk — only for the interactive file chooser when no input path is
+  given on the command line
 
-The Reconstructor itself uses only the Python standard library. Image rendering is delegated to the Constructor.
+Decoding and JSON export work without Pillow or a display when `--no-render` is
+used, which makes the Reconstructor usable on a headless relay host.
 
 ---
 
-## Recommended file layout
+## File layout
 
-Place the Reconstructor beside the current Constructor:
+Keep all four modules together:
 
-```text
-MCoreIMG-svg/
-├── MCoreIMG-Reconstructor.py
+```
+mcoreimg/
+├── MCoreIMG-model.py
+├── MCoreIMG-compression.py
 ├── MCoreIMG-Constructor.py
-├── example.mci
-└── example.mci.json
+└── MCoreIMG-Reconstructor.py
 ```
 
-Versioned Constructor filenames are also supported:
-
-```text
-MCoreIMG-svg/
-├── MCoreIMG-Reconstructor.py
-└── MCoreIMG-SVG-Constructor-v5.1-LOCALSPACE-HYBRID-VERIFIED.py
-```
-
-The Reconstructor searches:
-
-1. Its own directory
-2. The current working directory
-3. Preferred Constructor filenames
-4. Versioned filenames matching broad Constructor patterns
-
-Use `--core` when an exact Constructor must be selected.
+Each lookup falls back to the directory beside this file, then the working
+directory, and can be overridden with `--compression` or `--constructor`.
 
 ---
 
 ## Quick start
 
-Reconstruct a transport file:
+### Reconstruct a frame file
 
 ```bash
-python MCoreIMG-Reconstructor.py image.mci
+python MCoreIMG-Reconstructor.py received.mci
 ```
 
-Specify the output filename:
+Decodes, validates, renders a PNG beside the input, and opens it.
 
-```bash
-python MCoreIMG-Reconstructor.py image.mci \
-  --output reconstructed.png
-```
-
-Force an exact Constructor:
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci \
-  --core ./MCoreIMG-Constructor.py
-```
-
-Prevent the PNG from opening automatically:
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci --no-open
-```
-
-When no input path is supplied, the Reconstructor opens a graphical file chooser:
+### Choose the input interactively
 
 ```bash
 python MCoreIMG-Reconstructor.py
 ```
 
-Tkinter is only required for this interactive mode.
+### Decode without rendering
 
----
-
-## Supported input formats
-
-### MCoreIMG transport
-
-```text
-.mci
-.txt
+```bash
+python MCoreIMG-Reconstructor.py received.mci --no-render --list-commands
 ```
 
-The transport reader can extract frames from:
+### Recover editable source
 
-- Normal one-frame-per-line exports
-- Plain copied frame text
-- Lines containing labels before an `MCI...` frame
-- Multiple complete frames surrounded by unrelated text
-
-Duplicate frames are removed while preserving their original order.
-
-All frames in one input must use the same protocol version.
-
-### Editable MCoreIMG source
-
-```text
-.mci.json
-.json
+```bash
+python MCoreIMG-Reconstructor.py received.mci --dump-json
 ```
 
-Editable source files are passed to the selected Constructor's source loader.
+### Verify the installed set
 
-When the JSON contains `protocol_version`, the Reconstructor uses it to select a matching core.
-
-### SVG source
-
-```text
-.svg
-.svgz
+```bash
+python MCoreIMG-Reconstructor.py --show-core
+python MCoreIMG-Reconstructor.py --self-test
 ```
-
-SVG files are passed to the Constructor's SVG/source loader. This is useful for testing import and rendering parity without first exporting transport frames.
-
-SVG support depends on the selected Constructor.
-
----
-
-## Output behavior
-
-Unless `--output` is supplied, the Reconstructor writes a timestamped PNG beside the input file:
-
-```text
-image-reconstructed-20260802-211400.png
-```
-
-For an input named:
-
-```text
-image.mci.json
-```
-
-the generated name uses `image` as the base rather than `image.mci`.
-
-After rendering, the Reconstructor reports:
-
-- Reconstructor build
-- Selected Constructor path
-- Constructor build and version
-- Protocol and source version
-- Advertised feature signature
-- Transport envelope
-- Decoder and renderer APIs
-- Loaded representation
-- Decoded command count, when available
-- PNG dimensions and color mode
-- Final output path
-
-The PNG opens automatically unless `--no-open` is used.
 
 ---
 
@@ -239,764 +106,197 @@ The PNG opens automatically unless `--no-open` is used.
 
 | Option | Purpose |
 |---|---|
-| `input` | `.mci`, text, `.mci.json`, `.json`, `.svg`, or `.svgz` input |
-| `-o`, `--output PATH` | Select the output PNG path |
-| `--core PATH` | Use one exact Constructor Python file |
-| `--protocol N` | Force a protocol for source loading or self-test |
-| `--dump-json` | Write best-effort Constructor-compatible source JSON |
-| `--list-commands` | Print decoded scene and command contents |
-| `--no-open` | Do not open the PNG after reconstruction |
-| `--self-test` | Run Constructor encode/decode/render round-trip tests |
-| `--show-core` | Show the selected Constructor and API bindings, then exit |
-| `-h`, `--help` | Show command help |
+| `input` | `.mci`, text, `.mci.json`, `.json`, `.svg`, or `.svgz` file |
+| `-o`, `--output PATH` | Output PNG path |
+| `--compression PATH` | Path to `MCoreIMG-compression.py` |
+| `--constructor PATH` | Path to `MCoreIMG-Constructor.py` |
+| `--protocol N` | Require a specific protocol number |
+| `--dump-json` | Write a Constructor-compatible source JSON |
+| `--list-commands` | Print the decoded command stream |
+| `--no-render` | Decode only; do not produce a PNG |
+| `--no-open` | Do not automatically open the PNG |
+| `--self-test` | Run codec and rendering round-trip tests |
+| `--show-core` | Print the loaded modules and exit |
 
----
+### Exit codes
 
-## Common workflows
-
-### Verify which Constructor will be used
-
-```bash
-python MCoreIMG-Reconstructor.py --show-core
-```
-
-Example diagnostic output:
-
-```text
-Codec core: /path/to/MCoreIMG-Constructor.py
-Constructor build: 2026.08.02-v5.1-localspace-hybrid
-Constructor version: v5.1
-Protocol: 5
-Source version: 5
-Features: PROTO5|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|10MSG
-Envelope: 10 message(s) × 150 characters
-Decoder API: module.decode_frames
-Renderer API: module.render_to_pillow
-Source loader: module.load_source
-```
-
-### Test Constructor/Reconstructor compatibility
-
-```bash
-python MCoreIMG-Reconstructor.py --self-test
-```
-
-The self-test attempts to use the selected Constructor's real:
-
-1. Sample document generator
-2. Encoder
-3. Frame decoder
-4. Renderer
-
-It verifies that the reconstructed image has the expected canvas dimensions.
-
-Hybrid optimization may legally change the command count, so the self-test does not require the decoded command count to equal the original authoring command count.
-
-### Test a specific protocol and core
-
-```bash
-python MCoreIMG-Reconstructor.py \
-  --self-test \
-  --protocol 5 \
-  --core ./MCoreIMG-Constructor.py
-```
-
-### Inspect decoded commands
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci --list-commands
-```
-
-This diagnostic traversal supports both:
-
-- Flat command lists
-- Hierarchical scene or document objects
-
-It is cycle-safe and does not attempt to reinterpret Constructor-owned group or copy semantics.
-
-### Recover editable JSON
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci --dump-json
-```
-
-This writes:
-
-```text
-image-reconstructed-YYYYMMDD-HHMMSS.mci.json
-```
-
-beside the generated PNG.
-
-The JSON export is intended for recovery and debugging, not guaranteed restoration of the original SVG authoring document.
-
----
-
-## Protocol matching
-
-The Reconstructor reads the protocol number directly from the MCoreIMG frame header before selecting a Constructor.
-
-The selection rule is strict:
-
-```text
-input protocol == Constructor PROTOCOL_VERSION
-```
-
-A protocol-5 frame is not decoded with a protocol-4 Constructor, even when the APIs appear similar.
-
-For editable JSON, `protocol_version` is used when present.
-
-For SVG files or JSON without a protocol declaration, the newest compatible Constructor is selected unless `--protocol` or `--core` is supplied.
-
-### Compatibility policy
-
-| Protocol | Support level |
+| Code | Meaning |
 |---|---|
-| 5 | Current target |
-| 4 | Best-effort through dynamic API adaptation |
-| 3 | Best-effort, including alpha-aware builds |
-| 2 | Best-effort for matching SVG Constructor builds |
-| Other | Only when a matching compatible Constructor exposes supported APIs |
-
-The adapter does not assume that the Constructor application version and transport protocol number are identical.
+| 0 | Success |
+| 1 | Interactive chooser cancelled |
+| 2 | User-facing reconstruction or compatibility error |
+| 130 | Interrupted with Ctrl-C |
 
 ---
 
-## Constructor discovery and ranking
+## Supported input
 
-When `--core` is not supplied, all viable Constructor candidates are inspected and ranked.
+### MCoreIMG transport
 
-The ranking considers:
+A `.mci` file with one frame per line, or any text containing complete frames.
+Frames are located by their `MCI` magic and validated individually, so pasted
+chat transcripts with surrounding conversation work as input.
 
-1. Required protocol match
-2. Current protocol-5 feature coverage
-3. Inferred Constructor application version
-4. Preferred canonical filename
-5. File modification time
+### Editable MCoreIMG source
 
-For protocol 5, the current feature tokens receive preference:
+`.mci.json` and `.json` files are handed to the Constructor's source loader and
+rendered directly. This path never touches the codec.
 
-```text
-PROTO5
-LOCALSPACE
-HYBRID
-PRIMITIVES
-GROUPCOPY
-ALPHA
-10MSG
-```
+### SVG source
 
-An older protocol-5 experiment can still be selected when it is the only compatible option, but `--show-core` may print a feature warning.
-
-### Exact override behavior
-
-`--core` is exclusive.
-
-When this is supplied:
-
-```bash
---core ./MCoreIMG-Constructor.py
-```
-
-the Reconstructor will inspect only that file. It will not silently substitute another Constructor from the same directory.
-
-This is intentional because silent substitution can hide compatibility mistakes during development.
+`.svg` and `.svgz` files are imported through the Constructor and rendered,
+which is useful for previewing what artwork will look like after transport.
 
 ---
 
-## Dynamic API compatibility
+## Data flow
 
-Different Constructor generations have exposed equivalent operations under different names and object layouts.
+### Transport path
 
-The Reconstructor uses capability discovery to support variations such as:
-
-### Decoder locations
-
-- Module-level function
-- `codec` object
-- `decoder` object
-- No-argument `Codec` class
-- No-argument `Decoder` class
-
-### Example decoder names
-
-```text
-decode_frames
-decode_transport_frames
-decode_message_frames
-decode_mci_frames
-decode_transport
-decode_image
-reconstruct_frames
-decode
+```
+input text/.mci
+    -> extract and validate complete MCI frames
+    -> check the protocol number in the frame header
+    -> mci.decode_frames(frames)          CRC and envelope validation
+    -> ctor.render_to_pillow(commands)
+    -> save PNG, optionally export editable JSON
 ```
 
-### Example renderer names
+### Source path
 
-```text
-render_to_pillow
-render_commands_to_pillow
-render_scene_to_pillow
-render_document_to_pillow
-render_scene
-render_document
-render_image
-rasterize_scene
-rasterize
-to_pillow
 ```
-
-### Example source-loader names
-
-```text
-load_source
-load_document
-import_source
-open_source
-load_file
-import_svg
-```
-
-The adapter records the selected APIs and reports them through `--show-core`.
-
----
-
-## Preserving scene-level state
-
-A decoder may return:
-
-- A list of commands
-- A document object
-- A scene object
-- A mapping
-- A wrapper containing commands and metadata
-- A tuple such as `(commands, metadata)`
-- An object containing local group tables or copy-reference state
-
-The Reconstructor preserves the raw decoded result instead of flattening it immediately.
-
-This matters for current and future features such as:
-
-- Local-space SVG definitions
-- Group-reference tables
-- Translated copies
-- Palette metadata
-- Primitive/vector optimization metadata
-- Scene-level transforms
-- Drawing-order state
-- Renderer-specific context
-
-Commands are extracted for diagnostics and fallback serialization, but the authoritative renderer receives the richest supported representation.
-
----
-
-## Constructor v5.1 behavior
-
-The current v5.1 Constructor introduces a hybrid local-space model.
-
-### Local-space SVG groups
-
-SVG geometry is encoded once in its own stable local coordinate system.
-
-Position and scale are stored separately as placement transforms. Resizing an imported SVG should therefore not cause its internal path data to grow merely because its rendered dimensions changed.
-
-### Fixed-width placement transforms
-
-Placement transforms provide bounded encoding cost for moving and scaling groups.
-
-This is central to the v5.1 correction for the earlier scaling problem where smaller or differently scaled SVGs could unexpectedly consume more transport space.
-
-### Hybrid primitive and SVG representation
-
-The Constructor can represent artwork using:
-
-- Legacy MCoreIMG primitive commands
-- General SVG/vector paths
-- Local-space SVG groups
-- Repeated translated group references
-
-The encoder can compare viable representations and choose the smaller transport encoding.
-
-### Translated group copies
-
-Repeated artwork can reuse a previously encoded local-space group and transmit only a placement difference when the Constructor determines that doing so is smaller.
-
-The Reconstructor delegates group-copy expansion and rendering to the matching Constructor.
-
-### Alpha
-
-Protocol 5 retains RGB565 color quantization with 4-bit alpha.
-
-The Constructor renderer remains authoritative for:
-
-- Alpha expansion
-- Fill compositing
-- Stroke compositing
-- Source-over behavior
-- Transparent overlaps
-- SVG fill rules
-
----
-
-## Architectural data flow
-
-### Transport reconstruction
-
-```text
-.mci or text input
-        |
-        v
-Extract complete MCI frames
-        |
-        v
-Validate one shared protocol version
-        |
-        v
-Discover matching Constructor
-        |
-        v
-Decode through Constructor API
-        |
-        v
-Preserve raw scene/document result
-        |
-        v
-Render through Constructor Pillow API
-        |
-        v
-Save PNG
-```
-
-### Source rendering
-
-```text
 .mci.json / .json / .svg / .svgz
-        |
-        v
-Inspect optional source protocol
-        |
-        v
-Discover matching Constructor
-        |
-        v
-Load through Constructor source API
-        |
-        v
-Render through Constructor Pillow API
-        |
-        v
-Save PNG
+    -> ctor.load_source(path)
+    -> document.transformed_commands()
+    -> ctor.render_to_pillow(commands)
 ```
 
 ---
 
 ## Frame parsing and validation
 
-The current frame parser expects:
+Frame text is scanned before a codec is chosen, so the program keeps four
+bootstrap constants (`FRAME_MAGIC`, `BASE62`, header length, message length).
+These are **verified against the codec** as soon as it loads. If the transport
+profile ever changes, the mismatch is reported rather than silently tolerated.
 
-- `MCI` magic
-- Printable ASCII transport
-- A 15-character current header
-- Base62 header fields
-- A payload length that keeps the full message within 150 characters
+`extract_frames` recovers complete frames from noisy text, deduplicates them,
+and confirms every frame declares the same protocol.
 
-The parser also retains a fallback for development transports that still store one complete frame per line but temporarily moved the payload-length field.
-
-The Reconstructor rejects:
-
-- Inputs containing no recognizable `MCI` frames
-- Mixed protocol versions in one stream
-- More frames than the selected Constructor's `MAX_MESSAGES`
-- A forced `--protocol` that conflicts with the detected input protocol
-
-Duplicate frames are removed in first-seen order.
+Decoding then rejects frames that are the wrong length, carry the wrong magic or
+protocol, declare an out-of-range part count, fail their CRC-16, come from a
+different image, conflict with a duplicate, leave a gap in the sequence, or fail
+the stream CRC-32.
 
 ---
 
-## Editable JSON recovery limitations
+## Protocol matching
 
-Transport reconstruction can be visually exact while editable source recovery remains incomplete.
+Three protocol numbers must agree: the one in the input frames, the one the
+codec implements, and the one the Constructor was built against.
 
-Information that may not survive transport includes:
+- Input versus codec is checked before decoding.
+- Codec versus Constructor is checked at load time.
+- `--protocol N` adds an explicit assertion for scripted use.
 
-- Original SVG layer names
-- Editor-specific metadata
-- Original XML structure
-- Unused definitions
-- Authoring-time grouping
-- Labels not included in transport
-- Pre-optimization command choices
-- Primitive-versus-vector alternatives discarded by optimization
-
-`--dump-json` follows this priority:
-
-1. Constructor-provided `to_json()` data
-2. A decoded mapping that already contains command data
-3. A generic fallback containing canvas metadata and extracted commands
-
-When scene-level local groups or repeat records remain available in the decoded object, the Constructor's own JSON representation is preferred.
-
----
-
-## Troubleshooting
-
-### Compatible Constructor not found
-
-Example:
+Any mismatch produces exit code 2 and an error naming the files and their build
+strings. For example:
 
 ```text
-A compatible MCoreIMG Constructor core for protocol 5 was not found.
+Reconstruction failed:
+Input needs protocol 4, but the codec beside this file is protocol 5.
+  Codec: /path/to/MCoreIMG-compression.py
+Pair this Reconstructor with the matching codec, or pass --compression.
 ```
 
-Check that:
-
-- The Constructor is beside the Reconstructor
-- The Constructor declares the same `PROTOCOL_VERSION` as the input
-- The Constructor imports without errors
-- The Constructor exposes a supported decoder
-- The Constructor exposes a supported Pillow renderer
-
-Inspect selection directly:
-
-```bash
-python MCoreIMG-Reconstructor.py --show-core
-```
-
-Or specify the file:
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci \
-  --core /full/path/to/MCoreIMG-Constructor.py
-```
-
-### Rejected candidate: wrong protocol
-
-Example:
-
-```text
-protocol 4; input requires protocol 5
-```
-
-The transport and Constructor do not match. Use the Constructor version that originally exported the transport, or re-export the image with the current Constructor.
-
-Do not bypass this check by changing the protocol constant manually. Protocol generations may differ in opcodes, palette representation, group semantics, and frame layout.
-
-### Constructor import failed
-
-The final error lists rejected candidates and their import errors.
-
-Run the Constructor directly to expose missing dependencies:
-
-```bash
-python MCoreIMG-Constructor.py
-```
-
-Common causes include:
-
-- Missing Pillow
-- Missing Tkinter
-- Syntax errors in a development Constructor
-- Imports that rely on files not present beside the Constructor
-- Running an unsupported Python version
-
-### No MCoreIMG frames found
-
-Confirm the file contains complete lines beginning with:
-
-```text
-MCI
-```
-
-Do not paste truncated chat previews or wrapped messages. Each exported frame must remain complete.
-
-### Mixed protocol versions
-
-One input stream cannot combine frames from different protocol generations.
-
-Remove unrelated frames and reconstruct one exported image at a time.
-
-### Too many frames
-
-The selected Constructor determines the maximum through `MAX_MESSAGES`.
-
-The current target allows ten messages. A file containing more unique frames is rejected before decoding.
-
-### Tkinter unavailable
-
-Supply the input path explicitly:
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci
-```
-
-The graphical chooser is optional.
-
-### PNG reconstructed but did not open
-
-The PNG has already been saved successfully. Desktop opening is only a convenience step.
-
-Open the reported output path manually or use:
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci --no-open
-```
-
-### `--dump-json` does not recreate the original SVG
-
-This is expected when the transport did not preserve authoring metadata. Compare rendered output rather than expecting byte-for-byte restoration of the original SVG source.
-
-### Self-test helpers unavailable
-
-Some older Constructors do not expose a sample document or encoder suitable for the integrated round trip.
-
-The Constructor may still reconstruct real transport successfully even when `--self-test` cannot run.
+Older v2, v3, and v4 transports are not decodable by this build. Use a
+Reconstructor and codec pair from the matching generation.
 
 ---
 
-## Security note
+## Module loading
 
-A Constructor selected through `--core` or automatic discovery is imported and executed as Python code.
+Both siblings use hyphenated filenames, which are not legal Python identifiers,
+so they are loaded by path.
 
-Only use Constructor files you trust.
+Import order matters. The codec is loaded first and registered in `sys.modules`;
+the Constructor then reuses that same module object rather than creating a
+second one. This is deliberate — two copies would define two distinct
+`VectorCommand` classes, and objects decoded by one would not be recognised by
+the other.
 
-Do not place untrusted Python files matching names such as:
-
-```text
-MCoreIMG-Constructor*.py
-MCoreIMG-SVG-Constructor*.py
-```
-
-beside the Reconstructor or in the working directory.
-
-MCoreIMG transport data is treated as data, but the Constructor core is executable code.
+`--no-render` makes the Constructor optional, so a headless host can decode and
+export JSON with only the codec and model present.
 
 ---
 
-## Exit codes
-
-| Code | Meaning |
-|---|---|
-| `0` | Success |
-| `1` | Graphical file selection cancelled |
-| `2` | Reconstruction, compatibility, input, or rendering error |
-| `130` | Interrupted with Ctrl-C |
-
-These stable exit codes make the Reconstructor suitable for scripts and future application integration.
-
-Example:
-
-```bash
-python MCoreIMG-Reconstructor.py image.mci --no-open
-status=$?
-
-if [ "$status" -eq 0 ]; then
-    echo "Reconstruction succeeded"
-else
-    echo "Reconstruction failed with code $status"
-fi
-```
-
----
-
-## Maintenance guide
-
-The code is divided into documented technical-debt boundaries:
-
-1. Protocol constants and API-name registries
-2. Constructor discovery and ranking
-3. Dynamic API inspection
-4. Safe version-dependent invocation
-5. Decoded scene normalization
-6. Frame extraction and protocol detection
-7. JSON recovery
-8. Diagnostic command traversal
-9. Integrated self-testing
-10. CLI orchestration and error handling
-
-When adapting the Reconstructor to a future Constructor:
-
-### 1. Identify the transport protocol
-
-Check:
-
-```python
-PROTOCOL_VERSION
-SOURCE_VERSION
-CONSTRUCTOR_BUILD
-FEATURE_SIGNATURE
-MAX_MESSAGES
-MESSAGE_LEN
-```
-
-### 2. Add preferred filenames only when useful
-
-The broad glob search already finds most versioned Constructor names.
-
-Add a filename to `PREFERRED_CORE_FILENAMES` when it should receive a canonical ranking bonus.
-
-### 3. Extend API registries before adding special cases
-
-When a Constructor renames a public operation, first update the appropriate registry:
-
-- `DECODER_NAMES`
-- `HIGH_LEVEL_RENDER_NAMES`
-- `RENDERER_NAMES`
-- `SOURCE_LOADER_NAMES`
-- `ENCODER_NAMES`
-- `OWNER_NAMES`
-
-Capability discovery is preferable to protocol-specific branching.
-
-### 4. Preserve the raw decoder result
-
-Do not replace the scene or document with only a command list unless the Constructor itself returns only commands.
-
-Future renderers may depend on scene-level tables and metadata.
-
-### 5. Keep the Constructor renderer authoritative
-
-Do not duplicate:
-
-- Alpha compositing
-- SVG path filling
-- Fill rules
-- Palette expansion
-- Group placement
-- Primitive rendering
-- Copy-reference expansion
-
-unless the protocol is intentionally being split into an independent decoder library.
-
-### 6. Update feature-signature ranking
-
-When a new current protocol becomes authoritative, update:
-
-- `PREFERRED_PROTOCOL_VERSION`
-- Preferred filenames
-- Current feature-token set
-- Build documentation
-- Self-test expectations
-
-### 7. Test both API styles
-
-At minimum, test:
-
-- Flat command-list decoder output
-- Scene/document decoder output
-- Tuple `(commands, metadata)` output
-- Module-level APIs
-- Object/class-owned APIs
-- Explicit `--core`
-- Automatic discovery
-- Protocol mismatch rejection
-- PNG output
-- RGBA alpha output
-- JSON export
-- Self-test
-
----
-
-## Design invariants
-
-Future maintenance should preserve these rules:
-
-1. Never decode protocol N with a Constructor declaring another protocol.
-2. Prefer a verified current feature signature among same-protocol candidates.
-3. Treat `--core` as an exact override.
-4. Preserve the raw decoded scene until rendering and export are complete.
-5. Prefer the Constructor's renderer over local drawing reimplementation.
-6. Do not hide real codec errors as argument-signature fallbacks.
-7. Keep frame extraction strict enough to reject unrelated text.
-8. Retain one-frame-per-line compatibility for development transports.
-9. Use the Constructor's own message limit.
-10. Exercise the real encoder, decoder, and renderer during self-test when available.
-
----
-
-## Intended role in MCoreIMG
-
-The Reconstructor is the receiving-side reference application for the MCoreIMG image transport workflow:
-
-```text
-Artwork
-  -> Constructor
-  -> MCoreIMG transport frames
-  -> MeshCore messages
-  -> Reconstructor
-  -> PNG
-```
-
-Its priorities are:
-
-1. Correct protocol matching
-2. Exact rendering parity with the Constructor
-3. Resilience across Constructor API refactors
-4. Useful diagnostics during rapid protocol development
-5. Minimal duplicated codec logic
-6. Clear failure messages instead of silent corruption
-
-The Reconstructor is not intended to be a general-purpose SVG editor or a substitute for the Constructor's authoring interface.
-
----
-
-## Example complete workflow
-
-Export transport from the Constructor, then copy both files into the same directory:
-
-```text
-MCoreIMG-Constructor.py
-MCoreIMG-Reconstructor.py
-my-image.mci
-```
-
-Verify compatibility:
-
-```bash
-python MCoreIMG-Reconstructor.py --show-core
-```
-
-Run the codec round trip:
+## Self-test
 
 ```bash
 python MCoreIMG-Reconstructor.py --self-test
 ```
 
-Reconstruct the image:
+Six checks:
 
-```bash
-python MCoreIMG-Reconstructor.py my-image.mci --no-open
-```
+1. A simple document survives a full frame round trip.
+2. Frames are recovered from surrounding chat noise.
+3. A corrupted frame is rejected rather than silently rendered.
+4. An incomplete frame set is rejected.
+5. The protocol number in the header matches the codec.
+6. Rendering produces a canvas-sized image, when a Constructor is present.
 
-Inspect the decoded representation and create recovery JSON:
-
-```bash
-python MCoreIMG-Reconstructor.py my-image.mci \
-  --list-commands \
-  --dump-json \
-  --output my-image-reconstructed.png \
-  --no-open
-```
-
-Expected results:
+Successful output:
 
 ```text
-my-image-reconstructed.png
-my-image-reconstructed.mci.json
+MCoreIMG Reconstructor self-test: PASS (6 checks)
+protocol=5 frames=1 commands=2
 ```
 
 ---
 
-## Project files
+## Output
 
-```text
-MCoreIMG-Reconstructor.py
-README.md
-```
+### PNG
 
-The matching Constructor is maintained separately but must be available at runtime.
+Written beside the input unless `-o` is given, and opened automatically unless
+`--no-open` is passed. The image is rendered by the Constructor's authoritative
+Pillow renderer, so it matches what the sender previewed.
+
+### Editable JSON
+
+`--dump-json` writes a Constructor-compatible source document containing the
+decoded commands plus a `reconstructed` block recording the Reconstructor build,
+the timestamp, the input filename, and the codec build.
+
+This is a best-effort recovery. Rendering can be lossless even when authoring
+metadata — editor grouping, layer labels, the original document transform —
+cannot be recovered, because those are not transmitted.
+
+The result loads back into the Constructor and re-encodes to the same frames.
 
 ---
 
-## License
+## Module structure
 
-Use the same license selected for the main MCoreIMG repository. Add the repository's license file at the project root so the Constructor and Reconstructor remain under one consistent licensing policy.
+| Section | Contents |
+|---|---|
+| Bootstrap frame constants | The few values needed before a codec is chosen |
+| Module loading | Path-based import, pairing checks, `Core` container |
+| Frame text handling | Base62 headers, frame extraction, protocol detection |
+| Input classification | Transport versus source, output paths, opening files |
+| JSON export | Best-effort editable source recovery |
+| Decode, render, export | The actual pipeline |
+| Self-test | Round-trip and corruption checks |
+| Command line | Parser, diagnostics, orchestration |
+
+---
+
+## Development notes
+
+- The Reconstructor must never implement decoding. If it needs a codec
+  behaviour it does not have, add it to `MCoreIMG-compression.py` and export it.
+- Bootstrap constants are the one permitted duplication, and only because frame
+  scanning must precede codec selection. They are checked against the codec at
+  load time; keep that check working.
+- Prefer clear pairing errors over silent fallbacks. The whole point of the
+  rewrite was replacing guesswork with explicit checks.

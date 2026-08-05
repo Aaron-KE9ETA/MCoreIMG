@@ -1,0 +1,526 @@
+<?xml version="1.0"?>
+<svg
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns="http://www.w3.org/2000/svg"
+    xmlns:cc="http://web.resource.org/cc/"
+    xmlns:xlink="http://www.w3.org/1999/xlink"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:svg="http://www.w3.org/2000/svg"
+    xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+    xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+    xmlns:ns1="http://sozi.baierouge.fr"
+    viewBox="0 0 120 81"
+  >
+  <path
+      d="m0 0l1 12 12 1v-1h-2v-1h3v-1l-10-1 1-4-1-3 11-1-15-1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m8 1v1l9 2v-4l-9 1z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m17 0l-1 5h5v-1h-3l1-4h-2z"
+      fill="#929292"
+  />
+  <path
+      d="m19 0l-1 4 12 1-1-4 16 1c-2.099-3.6438-16.01-3.6209-17 1l-9-3z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m24 0v1l2 2h1l-3-3z"
+      fill="#929292"
+  />
+  <path
+      d="m27 0v3h1l-1-3z"
+      fill="#121212"
+  />
+  <path
+      d="m45 2l-8-1v1l9 4 1-5 6 2c-2.607-2.0875-5.485-3.8694-8-1z"
+      fill="#929292"
+  />
+  <path
+      d="m50 0v2h4v-2h-4z"
+      fill="#333"
+  />
+  <path
+      d="m54 0l1 3h1v-3h-2z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m56 0v4h4l-4-4z"
+      fill="#333"
+  />
+  <path
+      d="m59 0l1 4-5-3h-8l-1 1v2l6 5c2.267-2.9301 5.047-0.2099 8 1l6-7-4-3h-3z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m62 0v2l5-1-5-1z"
+      fill="#333"
+  />
+  <path
+      d="m62 2v1h4v4h2l1-7-7 2z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m68 7l-2-3-5 5 3 1-2 4h5c1.096 6.878 4.527 7.977 11 8l-1-3-7-2 5-2-5-4v-2l5 1 13-5c-1.051 10.279 7.191 10.395 6 0h4c4.69 5.378 17.94 4.3191 9 15l-5-4 2 10h-2c-6.133-11.686-19.276-0.874-27.907-0.735-3.603 0.059-5.357-3.414-9.093-3.265l4 15 1-5h1l-1 7h-4l5 3c3.037-7.585 10.21-6.219 17-8l4 1 5 1 5 2-4 7 4-1-5 4 4 3 4-11h1l1 4h8l-1-10h1l4 3h1c-0.71-4.363-2.78-5.984-7-7l7-30h-7l2 15h-2l-5-12c-9.653 2.1395-39.532-10.247-40 4z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m85 0v2l23 1 5 12h2c4.62-19.866-16.777-15-30-15z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m29 1l1 4h-6l4 3v6h1c3.199-11.021 16.671-5.6039 19 3l4-1-1 5 11.237 8.104 4.763 8.896-2-16 3-1c4.458 7.882 11.656 3.059 18 0v-1h-6l1-3-2-3-3-3h-1l-2 9h5c-4.577 4.132-8.344 0.302-13-2l1-3h-5l3-6c-4.183 0.143-11.095-4.2035-12 0l-4-5-3 2-16-5z"
+      fill="#333"
+  />
+  <path
+      d="m4 2c2.1099 3.8167 5.4692 4.5947 7 0h-7z"
+      fill="#121212"
+  />
+  <path
+      d="m11 3l1 3 3-2-4-1z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m11 4l-8 1 1 4 10 1v1h-3v1l5 1v-3l3 1-8-7z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m13 7l4-1c2.046 2.2607 3.486 1.36 5-1-3.583-0.0602-8.075-2.2963-9 2z"
+      fill="#333"
+  />
+  <path
+      d="m22 5v2h2v-2h-2z"
+      fill="#929292"
+  />
+  <path
+      d="m75 8v1l12-3-12 2z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m87 5l-17 4v2h6l3 3c1.401 4.932 18.563 3.908 24 5v1l-22-1v1l24 1-3-5 4 1c-4.25-6.739-10.345-0.525-15.39-3.429-3.008-1.731-2.509-5.7699-3.61-8.571z"
+      fill="#929292"
+  />
+  <path
+      d="m94 5l-1 10c6.247-2.595 11.34-1.57 14 5 10.68-8.906-3.95-11.166-9-15h-4m-94 1v7h9v-1h-8l-1-6z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m15.667 6.3333l0.666 0.3334-0.666-0.3334z"
+      fill="#929292"
+  />
+  <path
+      d="m21 7l-3 1v5l4 1-1-7z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m22 7l-1 4h3l-1 3h4c-0.309-3.921-1.36-5.4758-5-7z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m25 8v1l2 5h1v-6h-3z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m29 15l7 1c-1.948 3.103-3.406 3.409-7 3l7 28-6-3c1.114 3.63 2.17 5.342 6 6 0.001 8.686 0.595 26.214 9 31l-1-14 5-2 1 16h4l-1-21c-8.584 5.135-13.498 1.897-16-8l4 6 6-1v-1h-2v-1h9l-1-4h8c0.931-8.684 3.676-14.652-1-23l-14.891 0.157-7.109 10.843-4-7h5v-2l-7-5c4.921-0.813 10.179 0.811 13-4l5 4 9 2-8-6 1-5-4 1-2-8c-7.962-0.0053-14.479-3.2097-17 6z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m38 8v1h7l-7-1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m16 10v3h-16v68h43c-4.074-9.983-6.993-20.156-7-31l-10 3-1-7-3-6c-0.582 12.743-10.69 17.27-20 24l2-4-3-1 1-6h4l9-11c-4.479 1.345-6.8241 1.763-10-2l4 2-1-3h7v-2l-9-3v2l-4-5 5 1 1-5-7-2c3.9209-8.431 10.424-3.751 18-5v7h-9c2.066 6.162 8.898 2.354 13 0l-1 7 7-3-10 4 17 12-8-30c3.617 2.27 6.135 3.659 8-1h-17v-1l4 1 1-5h-3l1 3-6-4z"
+      fill="#333"
+  />
+  <path
+      d="m29 10v4h1l-1-4m17 0v4h1l-1-4z"
+      fill="#929292"
+  />
+  <path
+      d="m88 10l2 2v-2h-2z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m92.667 10.333l0.666 0.334-0.666-0.334z"
+      fill="#333"
+  />
+  <path
+      d="m61 12c0.654 3.054 2.007 2.936 5 3l2 4-1-5-6-2z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m90.667 12.333l0.666 0.334-0.666-0.334z"
+      fill="#333"
+  />
+  <path
+      d="m23 16l-4-1v1l5 2 2-3-3 1z"
+      fill="#929292"
+  />
+  <path
+      d="m24 17l6-2-6 2z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m58 14l-4 3v2l4 1v-6z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m119 14c-1.18 6.642-5.25 11.792 1 17l-1-17m-81 1v1h5l-5-1m35 0l-3 2 1 3c2.509-1.434 3.322-2.319 2-5z"
+      fill="#929292"
+  />
+  <path
+      d="m38 16c1.674 5.505 5.687 4.663 8 0h-8z"
+      fill="#333"
+  />
+  <path
+      d="m28 17v6h1l2-5-3-1z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m80 20h23c-5.05-3.598-18.981-5.689-23 0z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m3 19v1h6l-6-1z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m2 20l-1 5 6 1v-1h-3v-5h-2z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m4 20v5l15 2v-7h-15z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m9 20v1h4l-4-1z"
+      fill="#929292"
+  />
+  <path
+      d="m105 20l-5 1 2 5h2l1-6z"
+      fill="#333"
+  />
+  <path
+      d="m44 24l2 3 12 4c-0.402-5.04-3.067-6.718-8-6-1.774-3.051-3.668-4.009-6-1z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m72 22v1h4l-4-1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m32 27h8c-2.242-3.444-5.645-3.33-8 0z"
+      fill="#333"
+  />
+  <path
+      d="m33 27l9 5 2-4-3-1 3-3-11 3z"
+      fill="#929292"
+  />
+  <path
+      d="m41 28l6-4-6 4m73-3l-1 5 7 3-4-8h-2z"
+      fill="#333"
+  />
+  <path
+      d="m7 26v6l-5-1 4 5c2.9892-5.579 4.051-8.792 11-9l-10-1m52 0l-1 4h1l1-2c2.187 5.368 2.468 13.876 9 15l-1 3h7c3.226 3.37 7.865-1.002 11-3l-1 3c2.565-2.247 1.518-4.188-1-6v-6c-5.761 1.317-11.419 1.567-13 8l-5-3h4l1-7h-1c-1.33 3.247-2.354 4.926-6 5l-3-11h-2z"
+      fill="#929292"
+  />
+  <path
+      d="m82 26c1.806 3.272 3.382 3.81 7 3l-7-3z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m91 27v1h7l-7-1z"
+      fill="#333"
+  />
+  <path
+      d="m21 27l-2 2v1l4-3h-2z"
+      fill="#929292"
+  />
+  <path
+      d="m92 30l6-1c-2.698-1.521-4.219-1.593-6 1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m71 31l3-3-3 3m36-3l-2 5 1 1 3-6h-2z"
+      fill="#929292"
+  />
+  <path
+      d="m8 29v6h14v-5l-4-1c-2.969 2.996-4.951 2.835-8 0h-2z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m11 31v1l7-1h-7z"
+      fill="#929292"
+  />
+  <path
+      d="m77 34l5-4-5 4z"
+      fill="#333"
+  />
+  <path
+      d="m22 36l7-5-7 5z"
+      fill="#929292"
+  />
+  <path
+      d="m34 32l4 7 3-8-7 1z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m104 33v2l2-2h-2z"
+      fill="#121212"
+  />
+  <path
+      d="m10 34l5 3v2h-7l8 4 4-5 1 3 4 5 1 7 7-2c-4.061-9.848-12.306-16.147-23-17z"
+      fill="#929292"
+  />
+  <path
+      d="m87 34l1 8h1l-1-5 4-2-5-1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m114 34l1 8-1 3 6 3-1-13-5-1m-82 1v3h1l-1-3z"
+      fill="#929292"
+  />
+  <path
+      d="m0 36v6h1l-1-6z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m93 40h1l1-2c2.254 2.9 5.42 3.953 7 0l-5-2-4 4z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m106 36l1 1-1-1z"
+      fill="#121212"
+  />
+  <path
+      d="m88 37l1 4h4v-4h-5m-86.667 1.667l0.3334 0.666-0.3334-0.666z"
+      fill="#929292"
+  />
+  <path
+      d="m19 38l-7 7 3 6h-5l1 2h-4v5l10-7 4-2c0.802-4.404 1.033-7.48-2-11z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m84 38l1 8 1-3-15 5-3 2 3-3-3-1 1-3-5-4h-1l-2 12-16 4v1l8 1 1 24h66c0-9.392 2.18-21.847-0.32-30.896-1.45-5.252-8.09-8.045-12.68-6.104l-1-4h-1l-6 14h-1v-7l-3-3 5-4c-7.505 3.809-9.098 1.406-16-2z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m94 38l-5 3v2h8l-3-5z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m5 40l2 3v-3h-2z"
+      fill="#929292"
+  />
+  <path
+      d="m42 42v1h5v1l-3 1h7c-2.748-3.113-4.942-3.979-9-3z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m7 42v1h5l-5-1z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m2 43l-1 8c3.7914-2.284 4.9762-5.309 1-8m5 0v1h5l-5-1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m81.667 43.333l0.666 0.334-0.666-0.334z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m53 44c1.287 3.651 3.418 3.665 7 3v-2l-7-1z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m89 44l2 7 3-1-5-6m6 0c2.211 3.638 4.377 2.96 7 0h-7z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m10 46v5h5l-5-5z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m72 49l3-3-3 3z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m8 47l-2 6h-4l-1 6 3 1-2 4 7-6-2-5h4l-1-6h-2m62 0v3h1l1-3h-2z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m83 47l-3 6 3-6m10 0l-1 5c2.694-1.554 3.572-2.858 1-5m16 0l3 5-1-5h-2m-41 1v2h2v-2h-2z"
+      fill="#e6e6e6"
+  />
+  <path
+      d="m17 51l2 1h1l-2-3-1 2z"
+      fill="#929292"
+  />
+  <path
+      d="m98 50v4h1l-1-4z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m53 51l-1 5 6-3-5-2m39 1l2 5 2-6-4 1z"
+      fill="#929292"
+  />
+  <path
+      d="m37 52c1.35 8.653 6.679 13.004 15 9v-2l-8-1v1h2v1h-4l-5-8z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m10 58l5-2-5 2z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m42 57v3h4v-1h-2v-1l9 2c-0.982-4.581-7.116-3-11-3m11 3v9h1l-1-9z"
+      fill="#929292"
+  />
+  <path
+      d="m43 63v1h6l-6-1z"
+      fill="#b2b2b2"
+  />
+  <path
+      d="m47.667 65.333l0.666 0.334-0.666-0.334z"
+      fill="#929292"
+  />
+  <path
+      d="m44 67l2 7h1l2-8-5 1z"
+      fill="#121212"
+  />
+  <path
+      d="m45 71v8l5-1-5-7z"
+      fill="#4b4b4b"
+  />
+  <path
+      d="m45 81c2.993-0.064 4.346 0.054 5-3l-5 3z"
+      fill="#121212"
+  />
+  <metadata
+    >
+    <rdf:RDF
+      >
+      <cc:Work
+        >
+        <dc:format
+          >image/svg+xml</dc:format
+        >
+        <dc:type
+            rdf:resource="http://purl.org/dc/dcmitype/StillImage"
+        />
+        <cc:license
+            rdf:resource="http://creativecommons.org/licenses/publicdomain/"
+        />
+        <dc:publisher
+          >
+          <cc:Agent
+              rdf:about="http://openclipart.org/"
+            >
+            <dc:title
+              >Openclipart</dc:title
+            >
+          </cc:Agent
+          >
+        </dc:publisher
+        >
+        <dc:title
+          >Michel Aflaq and Salah Jadid in 1963 thumbnail</dc:title
+        >
+        <dc:date
+          >2013-09-30T19:32:24</dc:date
+        >
+        <dc:description
+          >This public domain image comes from https://commons.wikimedia.org/w/index.php?title=Category:PD-Syria&amp;filefrom=Hafez+al-Assad+and+his+top+officials+in+1971.png%0AHafez+al-Assad+and+his+top+officials+in+1971.pngand as of 2013-09-30 19:21:51 is this file, https://upload.wikimedia.org/wikipedia/commons/thumb/b/bd/Michel_Aflaq_and_Salah_Jadid_in_1963.jpg/120px-Michel_Aflaq_and_Salah_Jadid_in_1963.jpg. d .jpg .wikimedia.org </dc:description
+        >
+        <dc:source
+          >https://openclipart.org/detail/184302/michel-aflaq-and-salah-jadid-in-1963-thumbnail-by-syria-184302</dc:source
+        >
+        <dc:creator
+          >
+          <cc:Agent
+            >
+            <dc:title
+              >syria</dc:title
+            >
+          </cc:Agent
+          >
+        </dc:creator
+        >
+        <dc:subject
+          >
+          <rdf:Bag
+            >
+            <rdf:li
+              >120px-Michel_Aflaq_and_Salah_Jadid_in_1963</rdf:li
+            >
+            <rdf:li
+              >Michel_Aflaq_and_Salah_Jadid_in_1963</rdf:li
+            >
+            <rdf:li
+              >b</rdf:li
+            >
+            <rdf:li
+              >bd</rdf:li
+            >
+            <rdf:li
+              >commons</rdf:li
+            >
+            <rdf:li
+              >dig</rdf:li
+            >
+            <rdf:li
+              >mw-category-media</rdf:li
+            >
+            <rdf:li
+              >pd</rdf:li
+            >
+            <rdf:li
+              >publicdomain</rdf:li
+            >
+            <rdf:li
+              >syria</rdf:li
+            >
+            <rdf:li
+              >thumb</rdf:li
+            >
+            <rdf:li
+              >upload</rdf:li
+            >
+            <rdf:li
+              >upload2openclipart</rdf:li
+            >
+            <rdf:li
+              >vectorized</rdf:li
+            >
+            <rdf:li
+              >wikipedia</rdf:li
+            >
+          </rdf:Bag
+          >
+        </dc:subject
+        >
+      </cc:Work
+      >
+      <cc:License
+          rdf:about="http://creativecommons.org/licenses/publicdomain/"
+        >
+        <cc:permits
+            rdf:resource="http://creativecommons.org/ns#Reproduction"
+        />
+        <cc:permits
+            rdf:resource="http://creativecommons.org/ns#Distribution"
+        />
+        <cc:permits
+            rdf:resource="http://creativecommons.org/ns#DerivativeWorks"
+        />
+      </cc:License
+      >
+    </rdf:RDF
+    >
+  </metadata
+  >
+</svg
+>

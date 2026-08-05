@@ -68,7 +68,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-MODEL_BUILD = "2026.08.05-model-v5.2-MODULAR"
+MODEL_BUILD = "2026.08.05-model-v6.0-MODULAR"
 
 
 # ==========================================================================

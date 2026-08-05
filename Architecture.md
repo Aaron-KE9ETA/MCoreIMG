@@ -126,13 +126,15 @@ SVG / XML or editable JSON
     → VectorDocument
     → ordered VectorCommand objects
     → editor/document transforms
+    → geometry simplification                  (compression)
     → primitive representation planning        (compression)
     → local-space SVG group planning           (compression)
     → palette construction, RGB565 + A4        (compression)
-    → record selection and bit writing         (compression)
+    → record selection and syntax elements     (compression)
+    → adaptive range coding, or raw packing    (compression)
     → stream CRC-32
     → Base91 payload
-    → MeshCore frames with per-frame CRC-16
+    → MeshCore frames, 8-character headers
 ```
 
 ### Receiving
@@ -142,6 +144,7 @@ frame text
     → frame extraction and per-frame validation
     → reassembly and stream CRC-32 check
     → Base91 decode
+    → range decoding or raw unpacking          (compression)
     → record parsing and state reconstruction  (compression)
     → ordered VectorCommand objects
     → Pillow render                            (constructor)
@@ -157,6 +160,64 @@ reconstruction exactly as a receiver will see them.
 
 This is why rounding rules must be shared rather than duplicated: preview parity
 is a correctness property, not a nicety.
+
+---
+
+## Protocol v6 concepts
+
+Protocol 6 kept v5's structure and changed five things. Each is independent, so
+they can be reasoned about — and reverted — separately.
+
+### Slim frame header
+
+15 characters became 8. The per-frame CRC went because MeshCore already
+guarantees the integrity of a delivered message; the length field went because
+chunking fills every frame except the last, making length derivable from a
+final-frame flag. Frame index, that flag, and the coding mode now share one
+Base62 character.
+
+Usable payload rose from 1,350 to 1,420 characters.
+
+The stream CRC-32 stayed. It catches a different failure class than MeshCore
+does — frames from two images with colliding identifiers, or the wrong set
+pasted together — and costs four bytes once rather than per frame.
+
+### Geometry simplification
+
+Encoder-only, and the largest single win. Because transport coordinates are
+integers, a vertex within half a pixel of the line between its neighbours cannot
+change the decoded image, so removing it is lossless *at transport precision*.
+On traced artwork this removes 80–90% of vertices.
+
+Being encoder-only, the tolerance can be tuned without a protocol bump.
+
+### Predictive point coding
+
+Coordinates are residuals against a prediction rather than deltas against the
+previous point. Two predictors — previous point, and linear extrapolation — run
+in parallel, and both ends score them from decoded history. The selection costs
+no bits because the decoder can compute it.
+
+### Entropy coding
+
+An adaptive binary range coder replaced raw bit packing. This forced the one
+structural change in v6: the planner splices competing candidate records, and an
+adaptive coder cannot be spliced, so `BitWriter` now records *syntax elements*
+plus an estimated cost and entropy-codes once at the end.
+
+Because the coder has fixed overhead and loses on tiny images, each image is
+coded both ways and the smaller wins, with the mode flag carried in the frame
+header. Protocol 6 is therefore never worse than protocol 5.
+
+### Symmetry-aware repeats
+
+Repeat matching now covers the eight symmetries of the square. Those are exactly
+the transforms preserving integer coordinates, so matches stay exact.
+
+Repeat deltas moved from Rice to signed Exp-Golomb at the same time. This was
+not cosmetic: Rice with `k=2` spent over a hundred unary bits on a distance of
+200, so distant repeats always lost to a full record. Fixing it improved plain
+translated repeats as much as it enabled symmetric ones.
 
 ---
 
@@ -321,10 +382,14 @@ plan may exist for a given image. Improving this is safe from an architecture
 standpoint because it is entirely inside the codec, but it changes emitted bits
 and is therefore a protocol change.
 
-### Exact-translation-only repeat detection
+### Group repeats are translation-only
 
-Repeat detection requires exact translation. Rotated or scaled copies are only
-handled inside local-space groups.
+Single-command repeats match under the eight square symmetries, but contiguous
+runs still match under translation alone. Extending the search means trying
+eight symmetries across candidate positions and lengths, which needs a cost
+model before it is worth doing.
+
+Scaled repeats are not detected outside local-space groups at all.
 
 ### Opcode-dependent geometry dictionaries
 
@@ -365,6 +430,22 @@ Capture golden transport bytes and rendered rasters before restructuring, and
 confirm they are unchanged afterwards. The codebase has a history of behaviour
 hiding in surprising places; fixtures are the only reliable defence.
 
+This applies to *refactors*. When a protocol change intentionally alters the
+bytes, byte-level fixtures stop applying and correctness must be proven by
+semantic round trip instead: what the decoder returns must equal what the
+encoder promised to send.
+
+### Check writer/reader context symmetry
+
+With an adaptive coder, a writer and reader disagreeing about which context a
+bit belongs to is a silent failure: raw mode still works, so only entropy-coded
+images corrupt, and the error surfaces far from its cause. Every `w.bit(v, ctx)`
+needs a matching `r.bit(ctx)`.
+
+The reliable check is to record both context sequences over the fixtures and
+diff them. Three such mismatches were introduced and caught this way while
+adding the range coder; none were findable by reading the code.
+
 ### Keep the codec re-entrant
 
 Local-coordinate precision is passed as an argument, not held in module state.
@@ -390,4 +471,4 @@ python MCoreIMG-Reconstructor.py sample.mci --list-commands --dump-json --no-ope
 ```
 
 A healthy installation reports the same protocol number from every module and
-matching `-v5.2-MODULAR` build suffixes.
+matching `-v6.0` build suffixes.

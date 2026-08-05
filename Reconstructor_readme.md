@@ -3,7 +3,7 @@
 The receiving half of MCoreIMG. Turns transport frames, or an editable source
 file, back into a raster image.
 
-> **Build:** `2026.08.05-reconstructor-v5.2-MODULAR`
+> **Build:** `2026.08.05-reconstructor-v6.0-SLIMHEADER`
 > **Depends on:** `MCoreIMG-compression.py` for decoding, `MCoreIMG-Constructor.py` for rendering
 
 The Reconstructor contains **no codec of its own**. Decoding is done by the
@@ -176,17 +176,31 @@ input text/.mci
 ## Frame parsing and validation
 
 Frame text is scanned before a codec is chosen, so the program keeps four
-bootstrap constants (`FRAME_MAGIC`, `BASE62`, header length, message length).
+bootstrap constants (`FRAME_MAGIC`, `BASE62`, header length of 8, message
+length).
 These are **verified against the codec** as soon as it loads. If the transport
 profile ever changes, the mismatch is reported rather than silently tolerated.
 
 `extract_frames` recovers complete frames from noisy text, deduplicates them,
 and confirms every frame declares the same protocol.
 
+Protocol 6 has no length field, so frame boundaries are found differently:
+chunking fills every frame except the last, so a non-final frame is always
+exactly 150 characters and can be sliced out of a line containing several. A
+final frame runs to the end of its line. The part descriptor in the header says
+which kind it is.
+
 Decoding then rejects frames that are the wrong length, carry the wrong magic or
-protocol, declare an out-of-range part count, fail their CRC-16, come from a
-different image, conflict with a duplicate, leave a gap in the sequence, or fail
-the stream CRC-32.
+protocol, declare an out-of-range index, disagree about the coding mode, carry a
+short non-final payload, come from a different image, conflict with a duplicate,
+leave a gap in the sequence, declare two different final frames, or fail the
+stream CRC-32.
+
+There is no per-frame CRC in protocol 6. MeshCore guarantees the integrity of a
+delivered message, so the per-frame check was redundant on that path. Frames
+pasted from a chat transcript leave MeshCore's protection, and for those the
+stream CRC-32 still detects corruption — it just reports that the set is bad
+rather than naming the offending frame.
 
 ---
 
@@ -204,13 +218,14 @@ strings. For example:
 
 ```text
 Reconstruction failed:
-Input needs protocol 4, but the codec beside this file is protocol 5.
+Input needs protocol 5, but the codec beside this file is protocol 6.
   Codec: /path/to/MCoreIMG-compression.py
 Pair this Reconstructor with the matching codec, or pass --compression.
 ```
 
-Older v2, v3, and v4 transports are not decodable by this build. Use a
-Reconstructor and codec pair from the matching generation.
+Transports older than protocol 6 are not decodable by this build, including
+protocol 5: the frame header, point predictor, repeat records, and entropy coder
+all changed. Use a Reconstructor and codec pair from the matching generation.
 
 ---
 
@@ -249,7 +264,7 @@ Successful output:
 
 ```text
 MCoreIMG Reconstructor self-test: PASS (6 checks)
-protocol=5 frames=1 commands=2
+protocol=6 frames=1 commands=2
 ```
 
 ---

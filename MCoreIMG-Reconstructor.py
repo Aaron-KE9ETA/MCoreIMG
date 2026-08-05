@@ -71,7 +71,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-RECONSTRUCTOR_BUILD = "2026.08.05-reconstructor-v5.2-MODULAR"
+RECONSTRUCTOR_BUILD = "2026.08.05-reconstructor-v6.0-SLIMHEADER"
 
 COMPRESSION_FILENAME = "MCoreIMG-compression.py"
 CONSTRUCTOR_FILENAME = "MCoreIMG-Constructor.py"
@@ -92,7 +92,7 @@ class ReconstructorError(RuntimeError):
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 FRAME_MAGIC = "MCI"
-DEFAULT_FRAME_HEADER_LEN = 15
+DEFAULT_FRAME_HEADER_LEN = 8
 DEFAULT_MESSAGE_LEN = 150
 
 
@@ -266,11 +266,14 @@ def frame_protocol_version(frame: str) -> int:
 
 
 def _frame_length_at(text: str, start: int) -> Optional[int]:
-    """Calculate a complete frame length from the current 15-character header.
+    """Calculate a complete frame length from the 8-character protocol-6 header.
 
-    Returning ``None`` means the text at ``start`` is not safely parseable as a
-    current frame.  Payload and total-length bounds prevent arbitrary chat text
-    beginning with ``MCI`` from being consumed as transport data.
+    Protocol 6 dropped the payload-length field, because chunking fills every
+    frame except the last: a non-final frame is always exactly MESSAGE_LEN
+    characters, and the final frame simply runs to the end of the line.
+
+    Returning ``None`` means the text at ``start`` is not safely parseable,
+    which keeps ordinary chat text beginning with "MCI" from being consumed.
     """
     if text[start:start + 3] != FRAME_MAGIC:
         return None
@@ -278,10 +281,18 @@ def _frame_length_at(text: str, start: int) -> Optional[int]:
         return None
     header = text[start:start + DEFAULT_FRAME_HEADER_LEN]
     try:
-        payload_length = decode_base62(header[9:11])
+        decode_base62(header[3])          # protocol
+        part = decode_base62(header[7])   # index + final flag + coding mode
     except ReconstructorError:
         return None
-    total = DEFAULT_FRAME_HEADER_LEN + payload_length
+    if part >= 40:
+        return None
+    final = (part % 20) >= 10
+    if not final:
+        total = DEFAULT_MESSAGE_LEN
+        return total if start + total <= len(text) else None
+    # Final frame: consume the rest of the line, bounded by the envelope.
+    total = len(text) - start
     if total < DEFAULT_FRAME_HEADER_LEN or total > DEFAULT_MESSAGE_LEN:
         return None
     return total
@@ -290,10 +301,10 @@ def _frame_length_at(text: str, start: int) -> Optional[int]:
 def extract_frames(text: str) -> list[str]:
     """Extract unique complete MCI frames from exports or copied chat transcripts.
 
-    The primary parser uses the payload-length header field and printable-ASCII
-    constraints.  A one-frame-per-line fallback supports development transports
-    whose length field moved temporarily.  Mixed protocol versions are rejected
-    before core selection because they cannot form one coherent image stream.
+    Non-final frames are fixed length, so they can be sliced out of a line
+    containing several.  A final frame runs to the end of its line.  A
+    one-frame-per-line fallback covers anything the primary scan misses.
+    Mixed protocol versions are rejected because they cannot form one image.
     """
     frames: list[str] = []
     for raw_line in text.splitlines():

@@ -292,10 +292,10 @@ DEFAULT_MARGIN = 8
 # The editable JSON format is an editor concern and may evolve independently
 # of the transport protocol.
 SOURCE_FORMAT = "MCoreIMG-SVG-source"
-SOURCE_VERSION = 5
+SOURCE_VERSION = 6
 
-CONSTRUCTOR_BUILD = "2026.08.05-svg-v5.2-MODULAR-LOCALSPACE-HYBRID-10MSG"
-FEATURE_SIGNATURE = "PROTO5|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG"
+CONSTRUCTOR_BUILD = "2026.08.05-svg-v6.0-MODULAR-SLIMHEADER-10MSG"
+FEATURE_SIGNATURE = "PROTO6|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG"
 
 CSS_NAMED_FALLBACK = {
     "black": "#000000", "white": "#FFFFFF", "red": "#FF0000",
@@ -2148,7 +2148,7 @@ def run_self_test():
     encoded = encode_image(base_commands)
     decoded = decode_frames(encoded.frames)
     assert len(decoded) == len(base_commands)
-    assert MAX_MESSAGES == 10 and MAX_PAYLOAD_CHARS == 1350
+    assert MAX_MESSAGES == 10 and MAX_PAYLOAD_CHARS == 1420
 
     alpha_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle r="32" cx="35" cy="65" fill="#F00" opacity="0.5"/><circle r="32" cx="65" cy="65" fill="#0F0" opacity="0.5"/><circle r="32" cx="50" cy="35" fill="#00F" opacity="0.5"/></svg>'
     alpha_path = Path("/tmp/mcoreimg-v4-alpha.svg"); alpha_path.write_text(alpha_svg)
@@ -2269,7 +2269,7 @@ def verify_build_integrity() -> None:
         "model loaded": getattr(mci, "model", None) is not None,
         "model canvas": getattr(mci, "CANVAS_W", None) == 720
                         and getattr(mci, "CANVAS_H", None) == 480,
-        "codec protocol 5": getattr(mci, "PROTOCOL_VERSION", None) == 5,
+        "codec protocol 6": getattr(mci, "PROTOCOL_VERSION", None) == 6,
         "codec 10-message envelope": getattr(mci, "MAX_MESSAGES", None) == 10,
         "codec 150-char messages": getattr(mci, "MESSAGE_LEN", None) == 150,
         # Record types the v5 transport contract requires.

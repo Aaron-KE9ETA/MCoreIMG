@@ -7,8 +7,8 @@ messages**. It imports a practical SVG subset, combines it with compact
 radio-oriented drawing primitives, and compresses the result into a text-safe
 transport that survives ordinary chat relays.
 
-> **Protocol:** MCoreIMG v5
-> **Feature signature:** `PROTO5|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG`
+> **Protocol:** MCoreIMG v6
+> **Feature signature:** `PROTO6|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG`
 > **Status:** pre-alpha
 
 ---
@@ -122,12 +122,12 @@ python MCoreIMG-Reconstructor.py --self-test
 `--version` prints the whole chain, so a mismatched set is visible immediately:
 
 ```text
-2026.08.05-svg-v5.2-MODULAR-LOCALSPACE-HYBRID-10MSG
-PROTO5|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG
-protocol=5 messages=10 source_version=5
-codec=2026.08.05-compression-v5.2-MODULAR
+2026.08.05-svg-v6.0-MODULAR-SLIMHEADER-10MSG
+PROTO6|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG
+protocol=6 messages=10 source_version=6
+codec=2026.08.05-compression-v6.0-SLIMHEADER
 codec_path=/path/to/MCoreIMG-compression.py
-model=2026.08.05-model-v5.2-MODULAR
+model=2026.08.05-model-v6.0-MODULAR
 model_path=/path/to/MCoreIMG-model.py
 ```
 
@@ -139,15 +139,18 @@ model_path=/path/to/MCoreIMG-model.py
 |---|---|
 | Messages per image | 10 maximum |
 | Characters per message | 150 |
-| Frame header | 15 characters |
-| Payload per frame | 135 characters |
-| Total payload | 1,350 Base91 characters |
+| Frame header | 8 characters |
+| Payload per frame | 142 characters |
+| Total payload | 1,420 Base91 characters |
 | Canvas | 720 × 480 |
 | Palette | 32 entries, RGB565 + 4-bit alpha |
 | Commands | 2,048 maximum after expansion |
 
-Each frame carries protocol and image identification, part numbering, payload
-length, and a CRC-16. The reassembled stream carries a CRC-32.
+Each frame carries protocol and image identification and a single part
+descriptor. There is no per-frame CRC — MeshCore already guarantees message
+integrity — and no length field, because chunking fills every frame except the
+last. The reassembled stream still carries a CRC-32, which catches the
+mis-assembly MeshCore cannot see.
 
 ---
 
@@ -155,16 +158,29 @@ length, and a CRC-16. The reassembled stream carries a CRC-32.
 
 A short tour. [Compression_readme.md](Compression_readme.md) has the detail.
 
+**Geometry simplification.** Vertices that cannot survive integer rounding, or
+that sit within half a pixel of the line between their neighbours, are dropped
+before encoding. This is lossless at transport precision and routinely removes
+80–90% of the vertices in traced artwork.
+
+**Entropy coding.** An adaptive binary range coder models flags, record tags,
+and Exp-Golomb prefixes. Each image is coded both raw and entropy-coded and the
+smaller wins, so the coder's fixed overhead can never make a small image worse.
+
 **Palette.** Every colour is quantized to RGB565 plus 4-bit alpha and collected
 into an ordered table. Commands then reference palette indices.
 
 **Stateful coding.** Point and style state are tracked per opcode. Coordinates
-are usually deltas against the previous point for the same opcode, coded with
-Rice and Exp-Golomb, falling back to absolute only when that is cheaper.
+are coded as residuals against a prediction, falling back to absolute only when
+that is cheaper. Two predictors run in parallel — "same as the last point" and
+a linear extrapolation that tracks curves — and both ends score them from
+decoded history, so choosing between them costs no bits.
 
-**Repeat detection.** The encoder looks for translated copies of single
-commands and of contiguous command runs, and emits a short back-reference plus
-a delta rather than the geometry again.
+**Repeat detection.** The encoder looks for repeated single commands and
+contiguous runs, and emits a back-reference plus a delta rather than the
+geometry again. Repeats are matched under the eight symmetries of the square,
+so rotated and mirrored copies — four-way arrows, mirrored antenna elements,
+symmetric logos — are caught as well as plain translations.
 
 **Local-space SVG groups.** An imported SVG is normalized into a stable local
 coordinate box, transmitted once, and placed with a fixed-width transform.
@@ -191,6 +207,9 @@ ten-message budget.
 | 2 | `REC_GROUP_REPEAT` | Re-emit a contiguous run at a delta |
 | 3 | `REC_TRANSFORM_GROUP` | A local-space SVG group: display box plus an inline definition or a back-reference |
 
+Both repeat records carry an optional symmetry code (rotation and mirror), so
+a repeat is a symmetry plus a translation rather than a translation alone.
+
 ---
 
 ## File formats
@@ -210,11 +229,14 @@ and may evolve independently of the protocol version.
 
 ## Compatibility
 
-The Constructor emits protocol v5. A Reconstructor must understand v5
+The Constructor emits protocol v6. A Reconstructor must understand v6
 local-space SVG group records, compact primitives, translated repeats,
 RGB565+A4 palette entries, and the ten-message envelope.
 
-Older v2, v3, and v4 receivers will not correctly decode v5 images.
+Protocol 6 changed the frame header, the point predictor, the repeat records,
+and the entropy coder. Older receivers — including protocol 5 — will not
+decode v6 images. Pair each Constructor with its matching codec and
+Reconstructor.
 
 The current build detects mismatches directly. Protocol numbers are compared
 between the input, the codec, and the renderer, and every failure names the
@@ -226,7 +248,7 @@ files involved and their build strings.
 
 Before committing protocol or editor changes:
 
-1. Run `--version` on both tools and confirm protocol 5 with the expected
+1. Run `--version` on both tools and confirm protocol 6 with the expected
    feature signature and matching model/codec builds.
 2. Run `--self-test` on both tools.
 3. Import a normal SVG and a multi-SVG document.

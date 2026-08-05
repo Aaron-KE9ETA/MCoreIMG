@@ -7,7 +7,7 @@ geometry schema, the paint model, the colour quantization, and the compact
 primitives. It is the bottom of the dependency chain and imports nothing but
 the Python standard library.
 
-> **Build:** `2026.08.05-model-v5.2-MODULAR`
+> **Build:** `2026.08.05-model-v6.0-MODULAR`
 > **Depends on:** `copy`, `math`, `re`, `dataclasses`, `typing`
 
 ---

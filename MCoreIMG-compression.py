@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCoreIMG compression — protocol-v5 transport codec
+MCoreIMG compression — protocol-v6 transport codec
 ==================================================
 
 This module owns **everything that turns drawing commands into radio bytes and
@@ -23,7 +23,7 @@ WHAT LIVES HERE
 3.  Bit IO and the stateful point and style codecs.
 4.  Record writers and readers, including translated single-command and
     contiguous-group repeats.
-5.  Local-space SVG group planning (protocol v5's scale-independent groups).
+5.  Local-space SVG group planning (scale-independent groups).
 6.  Base91 payload coding, Base62 header fields, CRC, and MeshCore framing.
 
 WHAT LIVES IN THE MODEL MODULE
@@ -49,10 +49,10 @@ PUBLIC API
     Full inverse pipeline with CRC and envelope validation.
 
 ``encode_commands(commands, local_extent=...) -> (bytes, bit_count, metrics, palette)``
-``decode_commands(data) -> (list[VectorCommand], palette)``
+``decode_commands(data, mode) -> (list[VectorCommand], palette)``
     Bitstream layer only, for tests and tooling that bypass framing.
 
-RECORD LAYOUT (protocol 5)
+RECORD LAYOUT (protocol 6)
 --------------------------
 
 A stream is::
@@ -94,16 +94,18 @@ bump :data:`PROTOCOL_VERSION` and update the Reconstructor in the same commit.
 from __future__ import annotations
 
 import copy
+import itertools
 import importlib.util
 import json
 import math
 import sys
+import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-COMPRESSION_BUILD = "2026.08.05-compression-v6.0-SLIMHEADER"
+COMPRESSION_BUILD = "2026.10.17-compression-v7.1-CHANNEL120"
 
 
 # ===========================================================================
@@ -233,25 +235,42 @@ validate_command = model.validate_command
 # ==========================================================================
 
 
-# PROTOCOL_VERSION is written into both the bitstream and every frame header.
-PROTOCOL_VERSION = 6
+# PROTOCOL_VERSION is written into the bitstream. The frame format version is
+# carried by the magic strings themselves (see the header layout below).
+PROTOCOL_VERSION = 7
 
 # MeshCore transport profile. Keep the arithmetic in one place so GUI counters,
 # encoder limits, and decoder validation cannot drift apart.
 MAX_MESSAGES = 10
-MESSAGE_LEN = 150
-# Header layout (protocol 6), all Base62:
-#   MCI  magic            3
-#   v    protocol         1
-#   iii  image id         3
-#   p    part descriptor  1   part = index + (10 if final frame else 0)
+# The target is a MeshCore channel, where a message is limited to 120
+# characters (direct messages allow 150). Every frame, data or parity, must fit.
+MESSAGE_LEN = 120
+# Header layout (protocol 7), all Base62:
+#   MCI   magic            3   also the frame-format version: a future format
+#                              changes the magic rather than spending a
+#                              character on a version field
+#   iiii  image id         4   ties every message of one image together
+#   p     part descriptor  1   index + 10*final + 20*mode
+#
+# Messages from many images can arrive interleaved on a shared channel, so the
+# image id is what sorts them into sets. It is a hash of the encoded stream,
+# which has two consequences: identical images sent by different stations
+# produce identical frames that simply merge, and a receiver can check, once a
+# set is complete, that the id really names that content. Four characters give
+# 14.8 million ids, where protocol 6's three gave 238 thousand; on a busy
+# channel three characters would collide every few thousand images, and a
+# collision costs both images. The extra character comes from dropping the
+# header version field, so payload capacity is unchanged.
 #
 # There is no per-frame CRC: MeshCore already guarantees message integrity,
 # and the stream CRC-32 still catches mis-assembly (colliding image ids, a
 # user pasting the wrong set). There is no length field either: chunking fills
 # every frame except the last, so a non-final frame is always exactly
 # MESSAGE_LEN characters and the final frame's length is what remains.
-FRAME_HEADER_LEN = 8
+IMAGE_ID_LEN = 4
+IMAGE_ID_SPACE = 62 ** IMAGE_ID_LEN
+FRAME_HEADER_LEN = 3 + IMAGE_ID_LEN + 1
+assert FRAME_HEADER_LEN == 8
 FRAME_PAYLOAD_LEN = MESSAGE_LEN - FRAME_HEADER_LEN
 MAX_PAYLOAD_CHARS = MAX_MESSAGES * FRAME_PAYLOAD_LEN
 FRAME_MAGIC = "MCI"
@@ -380,7 +399,12 @@ def build_palette(commands: Sequence[VectorCommand]) -> List[str]:
 _PROB_BITS = 11
 _PROB_ONE = 1 << _PROB_BITS
 _PROB_INIT = _PROB_ONE >> 1
-_MOVE_BITS = 5
+# Adaptation rate. LZMA's default of 5 is tuned for megabyte streams; an
+# MCoreIMG payload is at most 1,420 characters, so contexts never warm up
+# before the stream ends. Measured across the real corpus: 3 gives -0.38%,
+# 4 gives -0.93%, 6 gives +0.84%. A two-speed schedule (4 then 5) matched 4
+# without beating it, so the constant stays a constant.
+_MOVE_BITS = 4
 _RC_TOP = 1 << 24
 _MASK32 = 0xFFFFFFFF
 
@@ -735,6 +759,17 @@ def rice_signed_length(v:int,k:int=3)->int:
     return (z>>k)+1+k
 
 
+# Conditioning the point coder on previous residual magnitude and on history
+# depth was implemented and swept. Every added split made the payload larger,
+# monotonically with context count: flat -1.42%, two buckets -1.28%, six
+# buckets -0.90%. Merging existing models or capping prefix positions lower did
+# not help either, so the current context set is already a local optimum.
+#
+# A 1,420-character payload is context-starved rather than context-poor:
+# splitting a model halves the data each half sees, and at this size the models
+# never converge. Worth revisiting only if the envelope grows.
+
+
 def write_point(w: BitWriter, state: PointState, p: Tuple[int, int]) -> None:
     """Write one canvas point as a prediction residual or an absolute pair."""
     x, y = int(p[0]), int(p[1])
@@ -975,6 +1010,416 @@ def read_geometry(r: BitReader, opcode: int, state: PointState, palette: Optiona
         g["crater_color"] = palette[index]
     return g
 
+
+
+# ==========================================================================
+# Shape refitting
+# ==========================================================================
+#
+# Traced artwork arrives as long runs of straight segments approximating a
+# curve. Simplification removes redundant vertices but cannot change the
+# representation, so a smooth outline still costs one point per retained
+# vertex. Refitting replaces such a run with the shape it was approximating:
+# a handful of cubic Beziers, or an ellipse or rectangle when the geometry
+# really is one.
+#
+# Two acceptance rules, both required:
+#   1. the candidate must encode smaller, measured with the real record writer
+#   2. every original vertex must lie within REFIT_TOLERANCE of the candidate
+#
+# Rule 2 is checked against the *flattened* candidate, which is what a receiver
+# will actually draw, so the budget is on visible geometry rather than on
+# control points.
+
+REFIT_TOLERANCE = 0.5
+REFIT_MIN_POINTS = 8          # below this a refit cannot pay for itself
+
+
+
+
+
+
+
+
+def _as_ellipse(points, tolerance) -> Optional[Dict[str, Any]]:
+    """Recognise a traced circle or axis-aligned ellipse."""
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    cx, cy = (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+    rx, ry = (max(xs) - min(xs)) / 2.0, (max(ys) - min(ys)) / 2.0
+    if rx < 2 or ry < 2:
+        return None
+    for x, y in points:
+        # distance from the ellipse, scaled back into pixels
+        r = math.hypot((x - cx) / rx, (y - cy) / ry)
+        if abs(r - 1.0) * min(rx, ry) > tolerance:
+            return None
+    return {"cx": cx, "cy": cy, "rx": rx, "ry": ry}
+
+
+def _as_rect(points, tolerance) -> Optional[Dict[str, Any]]:
+    """Recognise a traced axis-aligned rectangle."""
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    for x, y in points:
+        on_vertical = min(abs(x - x0), abs(x - x1)) <= tolerance
+        on_horizontal = min(abs(y - y0), abs(y - y1)) <= tolerance
+        if not (on_vertical or on_horizontal):
+            return None
+    # Reject a plain L or U: every edge of the box must actually be occupied.
+    edges = [False, False, False, False]
+    for x, y in points:
+        if abs(x - x0) <= tolerance: edges[0] = True
+        if abs(x - x1) <= tolerance: edges[1] = True
+        if abs(y - y0) <= tolerance: edges[2] = True
+        if abs(y - y1) <= tolerance: edges[3] = True
+    if not all(edges):
+        return None
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
+def _densify_closed(candidate: VectorCommand, drawn) -> List[Tuple[float, float]]:
+    """Return a closed outline dense enough to measure distance against.
+
+    ``command_points`` gives a rect four corners and an ellipse its extremes,
+    which is fine for bounding boxes but far too coarse for an error metric.
+    """
+    if candidate.opcode == OP_ELLIPSE:
+        g = candidate.geom
+        cx, cy = float(g["cx"]), float(g["cy"])
+        rx, ry = float(g["rx"]), float(g["ry"])
+        steps = 180
+        return [(cx + rx * math.cos(2 * math.pi * i / steps),
+                 cy + ry * math.sin(2 * math.pi * i / steps)) for i in range(steps + 1)]
+    if candidate.opcode == OP_RECT:
+        g = candidate.geom
+        x, y, w, h = float(g["x"]), float(g["y"]), float(g["w"]), float(g["h"])
+        return [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]
+    points = list(drawn)
+    if points and points[0] != points[-1]:
+        points.append(points[0])
+    return points
+
+
+def _outline_deviation(source_points, candidate: VectorCommand, limit: float = float("inf")) -> float:
+    """Worst distance from an original vertex to the candidate's drawn outline.
+
+    Closed candidates must have their final edge included. Leaving it out made
+    every point near the closing edge look far from the shape, which silently
+    rejected correct rectangle and ellipse matches.
+    """
+    try:
+        drawn = command_points(candidate)
+    except Exception:
+        return float("inf")
+    if candidate.opcode in (OP_RECT, OP_ELLIPSE, OP_POLYGON):
+        drawn = _densify_closed(candidate, drawn)
+    if len(drawn) < 2:
+        return float("inf")
+    worst = 0.0
+    segments = range(len(drawn) - 1)
+    for point in source_points:
+        best = min(_perpendicular_distance(point, drawn[i], drawn[i + 1]) for i in segments)
+        if best > worst:
+            worst = best
+            # Callers only ever ask "is this within budget", so stop as soon as
+            # the answer is no. This is the hot loop of the tolerance search.
+            if worst > limit:
+                return worst
+    return worst
+
+
+def refit_candidates(command: VectorCommand,
+                     tolerance: float = REFIT_TOLERANCE) -> List[VectorCommand]:
+    """Alternative representations of a traced run, all within tolerance.
+
+    Returns candidates only; the caller decides using encoded size. Ordering is
+    cheapest-shape-first so a caller that stops early still does well.
+    """
+    if command.opcode not in (OP_POLYLINE, OP_POLYGON):
+        return []
+    points = [tuple(float(v) for v in p) for p in command.geom.get("points", [])]
+    if len(points) < REFIT_MIN_POINTS:
+        return []
+    closed = command.opcode == OP_POLYGON
+    out: List[VectorCommand] = []
+
+    rect = _as_rect(points, tolerance) if closed else None
+    if rect is not None:
+        candidate = command.clone()
+        candidate.opcode = OP_RECT
+        candidate.geom = rect
+        out.append(candidate)
+
+    ellipse = _as_ellipse(points, tolerance) if closed else None
+    if ellipse is not None:
+        candidate = command.clone()
+        candidate.opcode = OP_ELLIPSE
+        candidate.geom = ellipse
+        out.append(candidate)
+
+    # Cubic Bezier refitting was implemented and measured here, and removed.
+    # It lost on every content class: a cubic segment costs three points, while
+    # Douglas-Peucker at the same tolerance retains fewer total vertices, and
+    # the predictive point codec handles consecutive polyline vertices better
+    # than it handles control points. Measured -0.1% payload for +26% encode
+    # time across the corpus. Recognising exact shapes is kept because it
+    # replaces the whole run with a handful of numbers rather than trading one
+    # point representation for another.
+
+    # Enforce the visible-geometry budget on every candidate before returning.
+    return [c for c in out if _outline_deviation(points, c, tolerance) <= tolerance]
+
+
+
+TOLERANCE_LADDER = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+
+
+def _simplified_at(command: VectorCommand, tolerance: float) -> VectorCommand:
+    return simplify_commands([command], tolerance)[0]
+
+
+def simplify_rate_distortion(commands: Sequence[VectorCommand],
+                             palette: Sequence[str]) -> Tuple[List[VectorCommand], int]:
+    """Choose a simplification tolerance per object instead of globally.
+
+    A single global tolerance has to be set for the most delicate object in the
+    image, which wastes bits on every large smooth contour. This walks a
+    ladder per object and keeps the coarsest setting that stays inside that
+    object's own deviation budget, measured against its original outline.
+
+    Primitives are never touched: their geometry is parametric, and text in
+    particular has no vertices to thin.
+    """
+    out: List[VectorCommand] = []
+    coarsened = 0
+    for command in commands:
+        if command.opcode not in (OP_POLYLINE, OP_POLYGON, OP_PATH):
+            out.append(command)
+            continue
+        try:
+            source_points = command_points(command)
+        except Exception:
+            out.append(command)
+            continue
+        if len(source_points) < REFIT_MIN_POINTS:
+            out.append(_simplified_at(command, SIMPLIFY_TOLERANCE))
+            continue
+
+        budget = _deviation_budget(command, source_points)
+        best = _simplified_at(command, SIMPLIFY_TOLERANCE)
+        best_cost = _record_cost(best, palette)
+        best_tolerance = SIMPLIFY_TOLERANCE
+        for tolerance in TOLERANCE_LADDER:
+            if tolerance <= SIMPLIFY_TOLERANCE:
+                continue
+            # Douglas-Peucker bounds deviation by its tolerance by definition,
+            # and corner protection only ever keeps extra vertices, so the
+            # budget test is a comparison rather than a measurement. Measuring
+            # it cost more encode time than the whole search saved.
+            if tolerance > budget:
+                break
+            candidate = _simplified_at(command, tolerance)
+            cost = _record_cost(candidate, palette)
+            if cost < best_cost:
+                best, best_cost, best_tolerance = candidate, cost, tolerance
+        if best_tolerance > SIMPLIFY_TOLERANCE:
+            coarsened += 1
+        out.append(best)
+    return out, coarsened
+
+
+
+# ==========================================================================
+# Perceptual palette merging
+# ==========================================================================
+#
+# Palette indices are fixed width: max(1, (count - 1).bit_length()). The width
+# therefore drops only at powers of two, so a palette of 17 costs every command
+# a fifth index bit that a palette of 16 does not, and the two extra entries
+# cost 20 bits each on top.
+#
+# Merging is attempted only when the palette sits just above such a boundary,
+# and only between colours close enough that the substitution is not visible.
+# Distance is weighted RGB, which tracks perceived difference far better than
+# plain Euclidean and is much cheaper than a full Lab conversion. Alpha is
+# compared separately because a translucent colour must never collapse into an
+# opaque one.
+
+PALETTE_MERGE_DISTANCE = 40.0
+PALETTE_MERGE_MAX_STEPS = 3
+
+
+def _palette_distance(a: str, b: str) -> float:
+    """Weighted RGB distance, with alpha treated as non-negotiable."""
+    ar, ag, ab, aa = color_to_rgba(a)
+    br, bg, bb, ba = color_to_rgba(b)
+    if abs(aa - ba) > 8:
+        return float("inf")
+    rmean = (ar + br) / 2.0
+    dr, dg, db = ar - br, ag - bg, ab - bb
+    return math.sqrt((2 + rmean / 256.0) * dr * dr + 4 * dg * dg
+                     + (2 + (255 - rmean) / 256.0) * db * db)
+
+
+def _index_width(count: int) -> int:
+    return max(1, (max(1, count) - 1).bit_length())
+
+
+def merge_palette(commands: Sequence[VectorCommand],
+                  palette: Sequence[str]) -> Tuple[List[VectorCommand], List[str], int]:
+    """Collapse near-identical colours to cross an index-width boundary.
+
+    Returns the recoloured commands, the new palette, and how many merges were
+    applied. A merge is only made when it actually narrows the index field, so
+    an image already at a power of two is left completely alone.
+    """
+    current = list(palette)
+    if len(current) < 3:
+        return list(commands), current, 0
+
+    target = 1 << (_index_width(len(current)) - 1)
+    if len(current) <= target or len(current) - target > PALETTE_MERGE_MAX_STEPS:
+        return list(commands), current, 0
+
+    # Rank candidate pairs by perceived difference and take the closest first.
+    pairs = []
+    for i in range(len(current)):
+        for j in range(i + 1, len(current)):
+            d = _palette_distance(current[i], current[j])
+            if d <= PALETTE_MERGE_DISTANCE:
+                pairs.append((d, i, j))
+    if len(pairs) < len(current) - target:
+        return list(commands), current, 0
+    pairs.sort()
+
+    mapping = {colour: colour for colour in current}
+    removed: set = set()
+    merges = 0
+    for _d, i, j in pairs:
+        if len(current) - len(removed) <= target:
+            break
+        a, b = current[i], current[j]
+        if a in removed or b in removed:
+            continue
+        # Keep the earlier entry; it is the one more commands already reference.
+        mapping[b] = mapping[a]
+        removed.add(b)
+        merges += 1
+
+    if len(current) - len(removed) > target or merges == 0:
+        return list(commands), current, 0
+
+    out: List[VectorCommand] = []
+    for command in commands:
+        clone = command.clone()
+        style = clone.style
+        # Palette entries are already RGB565+A4 quantized, so look up the
+        # quantized form of each colour rather than the source hex.
+        if style.fill is not None:
+            style.fill = mapping.get(quantize_palette_color(style.fill), style.fill)
+        if style.stroke is not None:
+            style.stroke = mapping.get(quantize_palette_color(style.stroke), style.stroke)
+        if clone.opcode == OP_PRIMITIVE and "crater_color" in clone.geom:
+            crater = quantize_palette_color(str(clone.geom["crater_color"]))
+            clone.geom["crater_color"] = mapping.get(crater, crater)
+        out.append(clone)
+    return out, build_palette(out), merges
+
+
+
+
+# ==========================================================================
+# Style-run reordering: implemented, measured, removed
+# ==========================================================================
+#
+# Real tracer output interleaves colours, so on the operator's test files the
+# same-style shortcut never fires: 97 commands produced 97 style runs, and each
+# re-sent its paint flags and palette index.
+#
+# A safe reorder was built for this. Draw order only matters between shapes
+# that overlap, so the overlap graph was topologically sorted preferring the
+# current style, keeping overlapping pairs in their original relative order.
+# It worked: style runs fell 97->64 and 64->40, and the rendered raster was
+# byte-identical.
+#
+# It still lost. Payload rose +0.1% to +0.4%, and adding a spatial-locality
+# tie-break made it worse rather than better. The point codec predicts from the
+# previous coordinate, so grouping by style scatters geometry and the extra
+# coordinate residuals cost more than the style bits saved.
+#
+# Capturing this overhead needs a record that carries several sub-outlines
+# under one style header without per-segment opcodes -- roughly 26 bits of
+# header times the records eliminated, about 9% on these files. That is a
+# protocol change, not a planning change.
+
+
+# ==========================================================================
+# Polygon start-point rotation
+# ==========================================================================
+#
+# A closed polygon's starting vertex is arbitrary: the decoder walks the same
+# loop whichever vertex it begins at. But the first point of a command is the
+# one the point codec can predict least well, because prediction carries over
+# from whatever was coded before it.
+#
+# Rotating each polygon to begin at the vertex nearest the previous coded
+# position turns that expensive first delta into a cheap one. It is free and
+# lossless, and needs no format change.
+#
+# Only OP_POLYGON is eligible. A polyline is an open path, so its endpoints
+# are meaningful and rotating it would change the drawing.
+
+
+
+
+# ==========================================================================
+# Start-point rotation and trellis quantization: measured, removed
+# ==========================================================================
+#
+# Both were implemented, verified correct, and removed on cost grounds.
+#
+# Start-point rotation re-phased closed subpaths to begin at the vertex
+# nearest the previous coded point, turning an expensive first delta into a
+# cheap one. Trellis quantization chose between floor and ceil per coordinate
+# to minimise the coded residual, in the manner of JPEG and HEVC encoders,
+# skipping anything involved in a repeat because two copies of one shape must
+# round identically or they stop matching.
+#
+# Measured on the real corpus: rotation saved 11 characters at no measurable
+# time cost, trellis saved 9 for +31ms, and together 17 for +80ms. Against a
+# 3,400-character corpus that is not worth two extra geometry passes and the
+# repeat-protection machinery trellis needs to be safe.
+#
+# The one change from that round that was kept is the entropy coder's
+# adaptation rate, because a constant costs nothing to run: see _MOVE_BITS.
+
+# ==========================================================================
+# Global coordinate precision: implemented, measured, removed
+# ==========================================================================
+#
+# Everything outside a local-space group is coded at full 720x480 precision,
+# so coding on a coarser global grid looked like it should shrink every
+# residual -- perhaps a bit per coordinate, and coordinates are most of the
+# payload.
+#
+# It was built: a two-bit grid index in the stream header, geometry scaled
+# before planning and scaled back after decoding, and a search across grids
+# alongside the local-precision ladder.
+#
+# It gained nothing: 0.0% on both portraits and -0.3% on the cart, for grid
+# errors up to 3px. The reason is that local-space SVG groups already
+# re-normalise their contents into a private coordinate box at whatever extent
+# the precision ladder picked, so a coarser global grid is normalised straight
+# back out again. The two mechanisms do the same job, and the local one is
+# already adaptive and lossless with respect to placement.
+#
+# It would only pay for content with no local groups at all, which the editor
+# does not produce: importing an SVG assigns one.
 
 # ==========================================================================
 # Symmetry-aware repeats
@@ -1685,10 +2130,17 @@ class CodecStats:
     transformed_group_reference_count: int = 0
     local_group_extent: int = 0
     coding_mode: int = 1
+    parity_frame_count: int = 0
 
     @property
     def fits(self) -> bool:
+        # Parity frames are deliberately outside the ten-message data budget.
         return self.frame_count <= MAX_MESSAGES
+
+    @property
+    def message_count(self) -> int:
+        """Messages actually transmitted: data frames plus parity frames."""
+        return self.frame_count + self.parity_frame_count
 
 
 @dataclass
@@ -1699,6 +2151,12 @@ class EncodedImage:
     stats: CodecStats
     image_id: str
     palette: List[str]
+    parity_frames: List[str] = field(default_factory=list)
+
+    @property
+    def transmit_frames(self) -> List[str]:
+        """Everything to send, in order: the data frames, then P, then Q."""
+        return list(self.frames) + list(self.parity_frames)
 
 
 # ==========================================================================
@@ -1765,8 +2223,67 @@ def _drop_repeated(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, f
     return out
 
 
+CORNER_ANGLE_DEG = 38.0
+
+
+def _corner_indices(points, threshold_deg: float = CORNER_ANGLE_DEG) -> List[int]:
+    """Indices where the outline turns sharply enough to be a real feature.
+
+    Douglas-Peucker measures distance from a chord, so a sharp corner sitting
+    close to that chord can be discarded even though removing it is exactly
+    what makes simplification look wrong. These indices are pinned.
+    """
+    keep: List[int] = []
+    for i in range(1, len(points) - 1):
+        ax, ay = points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]
+        bx, by = points[i + 1][0] - points[i][0], points[i + 1][1] - points[i][1]
+        na, nb = math.hypot(ax, ay), math.hypot(bx, by)
+        if na < 1e-9 or nb < 1e-9:
+            continue
+        cosine = max(-1.0, min(1.0, (ax * bx + ay * by) / (na * nb)))
+        if math.degrees(math.acos(cosine)) >= threshold_deg:
+            keep.append(i)
+    return keep
+
+
+def _simplify_protected(points, tolerance: float) -> List[Tuple[float, float]]:
+    """Douglas-Peucker applied between pinned corners rather than across them."""
+    corners = _corner_indices(points)
+    if not corners:
+        return _simplify_run(points, tolerance)
+    out: List[Tuple[float, float]] = []
+    bounds = [0] + corners + [len(points) - 1]
+    for a, b in zip(bounds, bounds[1:]):
+        piece = _simplify_run(points[a:b + 1], tolerance)
+        out.extend(piece[:-1])
+    out.append(points[-1])
+    return out
+
+
+def _feature_size(points) -> float:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _deviation_budget(command: VectorCommand, points) -> float:
+    """How far this object may move, in pixels.
+
+    Error that is invisible on a large smooth contour is obvious on a small
+    one, so the budget scales with feature size. Small objects, hairline
+    strokes and anything with a fill-less thin profile stay at the strict
+    half-pixel floor.
+    """
+    size = _feature_size(points)
+    if size < 24.0:
+        return 0.5
+    if command.style.fill is None and command.style.stroke_width <= 2.0 and size < 120.0:
+        return 0.5
+    return max(0.5, min(2.0, size * 0.004))
+
+
 def _simplify_points(points, minimum: int, tolerance: float) -> List[Tuple[float, float]]:
-    reduced = _simplify_run(_drop_repeated(points), tolerance)
+    reduced = _simplify_protected(_drop_repeated(points), tolerance)
     if len(reduced) < minimum:
         # Never violate the opcode's structural minimum; fall back to the
         # deduplicated form, then to the original.
@@ -1845,11 +2362,55 @@ def simplify_commands(commands: Sequence[VectorCommand],
 # Stream codec
 # ==========================================================================
 
+def _record_cost(command: VectorCommand, palette: Sequence[str]) -> int:
+    """Cost of writing one command as a normal record, in pre-entropy bits.
+
+    A fresh encoder state is used, so same-opcode and same-style shortcuts are
+    unavailable to every candidate equally. That handicaps the absolute number
+    but keeps the comparison between representations fair, which is all the
+    caller needs.
+    """
+    try:
+        writer = BitWriter()
+        _write_normal_record(writer, EncoderState(), quantize_command(command), palette)
+        return writer.cost
+    except Exception:
+        return 1 << 30
+
+
+def refit_commands(commands: Sequence[VectorCommand], palette: Sequence[str],
+                   tolerance: float = REFIT_TOLERANCE) -> Tuple[List[VectorCommand], int]:
+    """Replace traced runs with cheaper equivalent shapes.
+
+    Accepts a candidate only when it encodes strictly smaller. ``refit_candidates``
+    has already enforced the geometric budget, so this stage is purely about
+    size and can never trade accuracy for bits.
+    """
+    out: List[VectorCommand] = []
+    refits = 0
+    for command in commands:
+        candidates = refit_candidates(command, tolerance)
+        if not candidates:
+            out.append(command)
+            continue
+        best = command
+        best_cost = _record_cost(command, palette)
+        for candidate in candidates:
+            cost = _record_cost(candidate, palette)
+            if cost < best_cost:
+                best, best_cost = candidate, cost
+        if best is not command:
+            refits += 1
+        out.append(best)
+    return out, refits
+
+
 def encode_commands(
     commands: Sequence[VectorCommand],
     local_extent: int = LOCAL_GROUP_EXTENT,
+    preprocessed: bool = False,
 ) -> Tuple[bytes, int, Dict[str, int], List[str]]:
-    """Compress commands into the protocol-v5 bitstream.
+    """Compress commands into the protocol-v6 bitstream.
 
     ``local_extent`` selects the normalized coordinate range used for
     local-space SVG groups. Higher values keep more shape fidelity and cost
@@ -1857,8 +2418,15 @@ def encode_commands(
 
     Returns ``(payload_bytes, bit_count, metrics, palette)``.
     """
-    raw_source = simplify_commands([command.clone() for command in commands])
-    palette = build_palette(raw_source)
+    source = [command.clone() for command in commands]
+    palette = build_palette(source)
+    if preprocessed:
+        # encode_image already ran geometry selection; repeating it once per
+        # precision level tripled encode time for identical output.
+        raw_source, coarsened, refit_count = source, 0, 0
+    else:
+        raw_source, coarsened = simplify_rate_distortion(source, palette)
+        raw_source, refit_count = refit_commands(raw_source, palette)
     planned, primitive_count, vectorized_count = _plan_primitive_representations(raw_source, palette)
     if len(planned) > MAX_COMMANDS:
         raise MCIError(f"Optimized image expands to {len(planned)} commands; maximum is {MAX_COMMANDS}.")
@@ -1959,6 +2527,8 @@ def encode_commands(
     }
     data, mode = w.best_bytes()
     metrics["coding_mode"] = mode
+    metrics["refits"] = refit_count
+    metrics["coarsened"] = coarsened
     return data, len(data) * 8, metrics, palette
 
 
@@ -2050,6 +2620,7 @@ def decode_commands(data: bytes, mode: int = 1) -> Tuple[List[VectorCommand], Li
         for command in generated:
             state.recent[command.opcode] = command.clone()
             state.previous_opcode = command.opcode
+
     return result, palette
 
 # ==========================================================================
@@ -2107,31 +2678,456 @@ def dec62(s:str)->int:
 # Image layer
 # ==========================================================================
 
+
+# ==========================================================================
+# Erasure parity (RAID 6)
+# ==========================================================================
+#
+# Two extra messages, P and Q, let a receiver rebuild any two lost messages
+# out of the k + 2 sent -- data, parity, or one of each -- exactly as RAID 6
+# survives two failed disks. The k data frames are untouched: a receiver that
+# ignores parity frames decodes them as before.
+#
+# WHY NOT GF(256)
+#
+# Parity is normally computed over bytes in GF(256). Here that would produce
+# arbitrary bytes, which MeshCore cannot carry; Base91-encoding them grows the
+# parity by about 23%, so a parity frame would need ~175 characters for 142
+# characters of data and would not fit in a message.
+#
+# THE ALPHABET-PRESERVING CODE
+#
+# Instead the code works directly on Base91 symbols. 91 = 7 * 13, so by the
+# Chinese remainder theorem a symbol c in 0..90 is exactly the pair
+# (c mod 7, c mod 13), and any such pair is exactly one symbol. Parity is
+# computed independently in each residue and recombined, so every parity
+# symbol is again a Base91 character and a parity frame is exactly as long as
+# the data it protects.
+#
+# P + Q RAID 6 needs a field whose multiplicative group has at least k
+# distinct elements, to give each data frame its own Q coefficient:
+#
+#   mod 13  GF(13) has order 12; generator 2.          One symbol at a time.
+#   mod 7   GF(7) has only order 6, too few for k=10.  Adjacent symbols are
+#           paired into GF(49) = GF(7)[i], i^2 = -1 (irreducible because
+#           7 = 3 mod 4), which has order 48.
+#
+# With distinct coefficients, every 2x2 system the decoder can meet is
+# non-singular, which is the whole of the RAID 6 guarantee.
+#
+# FRAME LAYOUT
+#
+#   MCP   parity magic    3     distinct from MCI, so a receiver can tell a
+#   iiii  image id        4     parity frame apart before parsing it
+#   d     descriptor      1     which + 2*(k-1) + 20*mode, 0..39
+#   ...  parity symbols   L     L = longest data payload, rounded up to even
+#
+# The descriptor carries k and the coding mode, so a receiver that has lost
+# the final data frame -- or every data frame, when k = 1 -- still knows how
+# many frames exist and how to decode them. That also gives a receive engine
+# a denominator before the final data frame arrives.
+#
+# The one thing parity cannot carry is the exact length of the final data
+# frame: a parity frame is already full at MESSAGE_LEN. When the final
+# frame has to be rebuilt, its length is resolved by trying each candidate
+# and keeping the one whose stream is canonical Base91, passes the stream
+# CRC-32, and parses. More than one survivor is reported, never guessed.
+
+PARITY_MAGIC = "MCP"
+PARITY_FRAMES = 2
+PARITY_P = 0
+PARITY_Q = 1
+_PAD_SYMBOL = 0  # BASE91[0]; data shorter than L is padded with it
+
+_G13 = 2
+_G49 = 9  # 2 + 1*i, the smallest generator of GF(49)* in re + 7*im order
+
+
+def image_id_for(raw: bytes) -> str:
+    """The image id for an encoded stream (stream bytes plus stream CRC-32)."""
+    return enc62(zlib.crc32(raw) % IMAGE_ID_SPACE, IMAGE_ID_LEN)
+
+
+def _data_header(image_id: str, index: int, final: bool, mode: int) -> str:
+    part = index + (MAX_MESSAGES if final else 0) + (2 * MAX_MESSAGES if mode else 0)
+    return FRAME_MAGIC + image_id + enc62(part, 1)
+
+
+def _parity_header(image_id: str, which: int, k: int, mode: int) -> str:
+    return PARITY_MAGIC + image_id + enc62(which + 2 * (k - 1) + 2 * MAX_MESSAGES * mode, 1)
+
+
+def _gf13_inv(a: int) -> int:
+    return pow(a, 11, 13)
+
+
+def _gf49_add(x: int, y: int) -> int:
+    return ((x % 7 + y % 7) % 7) + 7 * ((x // 7 + y // 7) % 7)
+
+
+def _gf49_sub(x: int, y: int) -> int:
+    return ((x % 7 - y % 7) % 7) + 7 * ((x // 7 - y // 7) % 7)
+
+
+def _gf49_mul(x: int, y: int) -> int:
+    a, b, c, d = x % 7, x // 7, y % 7, y // 7
+    return ((a * c - b * d) % 7) + 7 * ((a * d + b * c) % 7)
+
+
+_GF49_INV = {x: next(y for y in range(1, 49) if _gf49_mul(x, y) == 1) for x in range(1, 49)}
+
+_COEF13 = [pow(_G13, j, 13) for j in range(MAX_MESSAGES)]
+_COEF49 = [1]
+for _j in range(MAX_MESSAGES - 1):
+    _COEF49.append(_gf49_mul(_COEF49[-1], _G49))
+del _j
+
+# The guarantee rests on these. Changing a generator is a protocol change, so
+# make it impossible to do silently.
+assert len(set(_COEF13)) == MAX_MESSAGES and 0 not in _COEF13
+assert len(set(_COEF49)) == MAX_MESSAGES and 0 not in _COEF49
+assert all((78 * (c % 7) + 14 * (c % 13)) % 91 == c for c in range(91))
+
+# (add, sub, mul, inverse, coefficients) per residue field
+_FIELD13 = (lambda a, b: (a + b) % 13, lambda a, b: (a - b) % 13,
+            lambda a, b: a * b % 13, _gf13_inv, _COEF13)
+_FIELD49 = (_gf49_add, _gf49_sub, _gf49_mul, _GF49_INV.__getitem__, _COEF49)
+
+
+def _crt91(r7: int, r13: int) -> int:
+    """Recombine residues into a Base91 symbol: 78 = 13*inv(13,7), 14 = 7*inv(7,13)."""
+    return (78 * r7 + 14 * r13) % 91
+
+
+def _symbols(payload: str, length: int) -> List[int]:
+    try:
+        values = [BASE91_INDEX[ch] for ch in payload]
+    except KeyError as exc:
+        raise FrameError(f"Invalid Base91 character {exc.args[0]!r} in frame payload.") from None
+    return values + [_PAD_SYMBOL] * (length - len(values))
+
+
+def _parity_length(payload_lengths: Sequence[int]) -> int:
+    longest = max(payload_lengths) if payload_lengths else 0
+    return longest + (longest & 1)
+
+
+def _parity_symbols(rows: Sequence[Sequence[int]], length: int) -> Tuple[List[int], List[int]]:
+    """P and Q over equal-length symbol rows."""
+    add13, _sub13, mul13, _inv13, c13 = _FIELD13
+    p13 = [0] * length
+    q13 = [0] * length
+    for j, row in enumerate(rows):
+        for t in range(length):
+            r = row[t] % 13
+            p13[t] = add13(p13[t], r)
+            q13[t] = add13(q13[t], mul13(c13[j], r))
+    p7 = [0] * length
+    q7 = [0] * length
+    for s in range(0, length, 2):
+        pe = qe = 0
+        for j, row in enumerate(rows):
+            e = row[s] % 7 + 7 * (row[s + 1] % 7)
+            pe = _gf49_add(pe, e)
+            qe = _gf49_add(qe, _gf49_mul(_COEF49[j], e))
+        p7[s], p7[s + 1] = pe % 7, pe // 7
+        q7[s], q7[s + 1] = qe % 7, qe // 7
+    return ([_crt91(p7[t], p13[t]) for t in range(length)],
+            [_crt91(q7[t], q13[t]) for t in range(length)])
+
+
+def _solve_erasures(fld, known: Dict[int, int], p: Optional[int], q: Optional[int],
+                    missing: Sequence[int]) -> Dict[int, int]:
+    """Solve one symbol position for up to two missing data values."""
+    add, sub, mul, inv, coef = fld
+    if not missing:
+        return {}
+    if len(missing) == 1:
+        x = missing[0]
+        if p is not None:
+            v = p
+            for d in known.values():
+                v = sub(v, d)
+            return {x: v}
+        v = q
+        for j, d in known.items():
+            v = sub(v, mul(coef[j], d))
+        return {x: mul(v, inv(coef[x]))}
+    x, y = missing
+    pp, qq = p, q
+    for j, d in known.items():
+        pp = sub(pp, d)
+        qq = sub(qq, mul(coef[j], d))
+    dx = mul(sub(qq, mul(coef[y], pp)), inv(sub(coef[x], coef[y])))
+    return {x: dx, y: sub(pp, dx)}
+
+
+def build_parity_frames(frames: Sequence[str]) -> List[str]:
+    """Return the P and Q frames protecting a complete, in-order data frame set."""
+    if not frames:
+        return []
+    head = frames[0][:FRAME_HEADER_LEN]
+    image_id, part = head[3:3 + IMAGE_ID_LEN], dec62(head[-1])
+    mode = 1 if part >= 2 * MAX_MESSAGES else 0
+    payloads = [f[FRAME_HEADER_LEN:] for f in frames]
+    length = _parity_length([len(x) for x in payloads])
+    rows = [_symbols(x, length) for x in payloads]
+    p_sym, q_sym = _parity_symbols(rows, length)
+    k = len(frames)
+    out = []
+    for which, symbols in ((PARITY_P, p_sym), (PARITY_Q, q_sym)):
+        out.append(_parity_header(image_id, which, k, mode) + "".join(BASE91[v] for v in symbols))
+    return out
+
+
+@dataclass
+class _DataFrame:
+    index: int
+    final: bool
+    mode: int
+    image_id: str
+    payload: str
+
+
+@dataclass
+class _ParityFrame:
+    which: int
+    k: int
+    mode: int
+    image_id: str
+    payload: str
+
+
+def _parse_frame(frame: str):
+    """Classify and validate one frame's header. Returns a _DataFrame or _ParityFrame."""
+    if len(frame) < FRAME_HEADER_LEN or len(frame) > MESSAGE_LEN:
+        raise FrameError("Invalid frame length.")
+    head, payload = frame[:FRAME_HEADER_LEN], frame[FRAME_HEADER_LEN:]
+    magic = head[:3]
+    if magic not in (FRAME_MAGIC, PARITY_MAGIC):
+        raise FrameError("Wrong frame magic.")
+    image_id = head[3:3 + IMAGE_ID_LEN]
+    dec62(image_id)  # validates the alphabet
+    descriptor = dec62(head[-1])
+
+    if magic == PARITY_MAGIC:
+        if descriptor >= 4 * MAX_MESSAGES:
+            raise FrameError("Parity descriptor is outside the transport profile.")
+        mode = 1 if descriptor >= 2 * MAX_MESSAGES else 0
+        descriptor -= 2 * MAX_MESSAGES * mode
+        k = descriptor // 2 + 1
+        if not payload or len(payload) % 2:
+            raise FrameError("Parity frame payload must be a non-empty even length.")
+        if k > 1 and len(payload) != FRAME_PAYLOAD_LEN:
+            raise FrameError(
+                f"Parity frame for {k} data frames carries {len(payload)} symbols; "
+                f"expected {FRAME_PAYLOAD_LEN}.")
+        return _ParityFrame(descriptor % 2, k, mode, image_id, payload)
+
+    mode = 1 if descriptor >= 2 * MAX_MESSAGES else 0
+    descriptor -= 2 * MAX_MESSAGES * mode
+    final = descriptor >= MAX_MESSAGES
+    index = descriptor - MAX_MESSAGES if final else descriptor
+    if not 0 <= index < MAX_MESSAGES:
+        raise FrameError("Frame index is outside the transport profile.")
+    # Chunking fills every frame except the last, so a non-final frame that is
+    # not exactly full has been truncated or concatenated.
+    if not final and len(payload) != FRAME_PAYLOAD_LEN:
+        raise FrameError(
+            f"Non-final frame {index} carries {len(payload)} payload characters; "
+            f"expected {FRAME_PAYLOAD_LEN}.")
+    return _DataFrame(index, final, mode, image_id, payload)
+
+
+def _stream_from_payloads(payloads: Sequence[str], image_id: str) -> Optional[bytes]:
+    """Return stream data if the payload text is canonical, CRC-valid, and is
+    the content its image id names."""
+    text = "".join(payloads)
+    try:
+        raw = base91_decode(text)
+    except MCIError:
+        return None
+    if len(raw) < 4 or base91_encode(raw) != text:
+        return None
+    data, crc = raw[:-4], int.from_bytes(raw[-4:], "big")
+    if zlib.crc32(data) != crc or image_id_for(raw) != image_id:
+        return None
+    return data
+
+
+@dataclass
+class Reassembly:
+    """A complete, in-order data frame set, and what it took to get there."""
+
+    frames: List[str]
+    recovered: List[int]
+    mode: int
+    k: int
+    parity_received: int
+    image_id: str = ""
+
+
+def reassemble_frames(frames: Sequence[str]) -> Reassembly:
+    """Validate a received set and rebuild up to two missing frames from parity.
+
+    Accepts any mix of data and parity frames in any order, with duplicates.
+    Raises FrameError when the set cannot be completed, saying what is missing
+    and how much parity arrived.
+    """
+    data: Dict[int, _DataFrame] = {}
+    parity: Dict[int, _ParityFrame] = {}
+    image_id: Optional[str] = None
+    mode: Optional[int] = None
+    final_index: Optional[int] = None
+    k_parity: Optional[int] = None
+
+    for raw in frames:
+        frame = _parse_frame(raw.strip())
+        if image_id is None:
+            image_id = frame.image_id
+        elif frame.image_id != image_id:
+            raise FrameError("Mixed image frames.")
+        if mode is None:
+            mode = frame.mode
+        elif frame.mode != mode:
+            raise FrameError("Frames disagree about the coding mode.")
+
+        if isinstance(frame, _ParityFrame):
+            if k_parity is not None and frame.k != k_parity:
+                raise FrameError("Parity frames disagree about the data frame count.")
+            k_parity = frame.k
+            previous = parity.get(frame.which)
+            if previous is not None and previous.payload != frame.payload:
+                raise FrameError("Conflicting duplicate parity frame.")
+            parity[frame.which] = frame
+            continue
+
+        if frame.final:
+            if final_index is not None and final_index != frame.index:
+                raise FrameError("Frame set declares two different final frames.")
+            final_index = frame.index
+        previous = data.get(frame.index)
+        if previous is not None and previous.payload != frame.payload:
+            raise FrameError("Conflicting duplicate frame.")
+        data[frame.index] = frame
+
+    if final_index is not None and k_parity is not None and final_index + 1 != k_parity:
+        raise FrameError("Parity and data frames disagree about the frame count.")
+    if final_index is not None:
+        k = final_index + 1
+    elif k_parity is not None:
+        k = k_parity
+    else:
+        raise FrameError("Frame set has no final frame; parts are missing.")
+    if any(index >= k for index in data):
+        raise FrameError("Data frame index lies beyond the final frame.")
+    if len(parity) == 2 and len(parity[PARITY_P].payload) != len(parity[PARITY_Q].payload):
+        raise FrameError("P and Q parity frames differ in length.")
+
+    missing = [j for j in range(k) if j not in data]
+    if not missing:
+        ordered = [_data_header(image_id, j, j == k - 1, mode) + data[j].payload for j in range(k)]
+        return Reassembly(ordered, [], mode, k, len(parity), image_id)
+    if len(missing) > len(parity):
+        # Parts are numbered from 1 here, matching the Constructor's frame
+        # listing and the Reconstructor's recovery report.
+        lost = ", ".join(str(j + 1) for j in missing)
+        raise FrameError(
+            f"Missing data parts {lost} of {k}. {len(parity)} of {PARITY_FRAMES} parity "
+            f"frame(s) received, enough to rebuild {len(parity)} missing part(s).")
+
+    length = len(next(iter(parity.values())).payload)
+    rows = {j: _symbols(f.payload, length) for j, f in data.items()}
+    if any(len(f.payload) > length for f in data.values()):
+        raise FrameError("A data frame is longer than its parity.")
+    p_row = _symbols(parity[PARITY_P].payload, length) if PARITY_P in parity else None
+    q_row = _symbols(parity[PARITY_Q].payload, length) if PARITY_Q in parity else None
+
+    rebuilt = {j: [0] * length for j in missing}
+    r13 = {j: [0] * length for j in missing}
+    for t in range(length):
+        known = {j: row[t] % 13 for j, row in rows.items()}
+        solved = _solve_erasures(_FIELD13, known,
+                                 None if p_row is None else p_row[t] % 13,
+                                 None if q_row is None else q_row[t] % 13, missing)
+        for j, v in solved.items():
+            r13[j][t] = v
+    for s in range(0, length, 2):
+        known = {j: row[s] % 7 + 7 * (row[s + 1] % 7) for j, row in rows.items()}
+        pe = None if p_row is None else p_row[s] % 7 + 7 * (p_row[s + 1] % 7)
+        qe = None if q_row is None else q_row[s] % 7 + 7 * (q_row[s + 1] % 7)
+        solved = _solve_erasures(_FIELD49, known, pe, qe, missing)
+        for j, v in solved.items():
+            rebuilt[j][s] = _crt91(v % 7, r13[j][s])
+            rebuilt[j][s + 1] = _crt91(v // 7, r13[j][s + 1])
+
+    payloads: Dict[int, str] = {j: f.payload for j, f in data.items()}
+    for j in missing:
+        if j != k - 1:
+            if length != FRAME_PAYLOAD_LEN:
+                raise FrameError("Parity length does not match a full data frame.")
+            payloads[j] = "".join(BASE91[v] for v in rebuilt[j])
+
+    final = k - 1
+    if final in missing:
+        # The final frame is padded to the parity length, and its true length
+        # is not carried anywhere. Every position past the true end must have
+        # rebuilt to the pad symbol; each remaining candidate is tried, and
+        # only one may yield a canonical, CRC-valid, parseable stream.
+        symbols = rebuilt[final]
+        last_real = max((t for t, v in enumerate(symbols) if v != _PAD_SYMBOL), default=-1)
+        survivors = []
+        for n in range(max(1, last_real + 1), length + 1):
+            text = "".join(BASE91[v] for v in symbols[:n])
+            trial = [payloads[j] for j in range(final)] + [text]
+            stream = _stream_from_payloads(trial, image_id)
+            if stream is None:
+                continue
+            try:
+                decode_commands(stream, mode)
+            except MCIError:
+                continue
+            survivors.append(text)
+        if not survivors:
+            raise FrameError("Parity reconstruction did not produce a valid stream.")
+        if len(survivors) > 1:
+            raise FrameError(
+                f"Rebuilt final frame has {len(survivors)} valid lengths; refusing to guess.")
+        payloads[final] = survivors[0]
+
+    ordered = [_data_header(image_id, j, j == final, mode) + payloads[j] for j in range(k)]
+    return Reassembly(ordered, missing, mode, k, len(parity), image_id)
+
+
 def _encode_image_once(commands: Sequence[VectorCommand], local_extent: int) -> EncodedImage:
     """Encode once at a particular local-coordinate precision.
 
     The precision is a plain argument, so this function is re-entrant and safe
     to call concurrently or from a library context.
     """
-    bit_bytes, bit_count, metrics, palette = encode_commands(commands, int(local_extent))
+    bit_bytes, bit_count, metrics, palette = encode_commands(commands, int(local_extent), preprocessed=True)
     mode = metrics.get("coding_mode", 1)
     raw = bit_bytes + zlib.crc32(bit_bytes).to_bytes(4, "big")
     payload = base91_encode(raw)
-    image_id = enc62(zlib.crc32(raw) % (62 ** 3), 3)
+    image_id = image_id_for(raw)
     chunks = [payload[i:i + FRAME_PAYLOAD_LEN] for i in range(0, len(payload), FRAME_PAYLOAD_LEN)] or [""]
     total = len(chunks)
+    # Over-budget images are framed as an empty set rather than as frames whose
+    # one-character part descriptors would silently alias past index 9.
+    #
+    # This must not raise. encode_image walks the precision ladder from highest
+    # fidelity downward and the first rungs are routinely over budget; aborting
+    # there made an image that fits at a lower precision fail outright.
+    # stats.fits carries the verdict, and every consumer of .frames checks it.
+    over_limit = total > MAX_MESSAGES
     if total > MAX_MESSAGES:
         # Still framed so the caller can report an honest over-limit result;
         # stats.fits is what decides whether it may be transmitted.
         pass
     frames = []
-    for index, chunk in enumerate(chunks):
+    for index, chunk in enumerate([] if over_limit else chunks):
         final = index == total - 1
-        # One Base62 character carries index, the final-frame flag, and the
-        # coding mode: index + 10*final + 20*mode, at most 39 of 62 values.
-        part = index + (MAX_MESSAGES if final else 0) + (2 * MAX_MESSAGES if mode else 0)
-        header = FRAME_MAGIC + enc62(PROTOCOL_VERSION, 1) + image_id + enc62(part, 1)
-        frames.append(header + chunk)
+        frames.append(_data_header(image_id, index, final, mode) + chunk)
     stats = CodecStats(
         metrics["transport_commands"], len(palette), bit_count, len(raw), len(payload), total,
         metrics["single_repeats"] + metrics["group_repeats"], metrics["group_repeats"],
@@ -2142,7 +3138,36 @@ def _encode_image_once(commands: Sequence[VectorCommand], local_extent: int) -> 
     return EncodedImage(raw, payload, frames, stats, image_id, palette)
 
 
-def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
+def prepare_geometry(commands: Sequence[VectorCommand]) -> List[VectorCommand]:
+    """Run the precision-independent geometry passes once.
+
+    Per-object tolerance selection and shape refitting depend only on the
+    source outlines, not on the local-coordinate extent, so doing them inside
+    the precision ladder repeats identical work up to fifteen times.
+    """
+    working = [command.clone() for command in commands]
+    palette = build_palette(working)
+    working, _coarsened = simplify_rate_distortion(working, palette)
+    working, _refits = refit_commands(working, palette)
+    working, _palette, _merges = merge_palette(working, build_palette(working))
+    return working
+
+
+def encode_image(commands: Sequence[VectorCommand], parity: bool = True) -> EncodedImage:
+    """Encode, then add the two RAID 6 parity frames when the image fits.
+
+    Parity is computed once on the chosen result, not on every rung of the
+    precision ladder, and never on an over-limit image. ``parity=False`` sends
+    the k data frames alone, saving two messages of airtime.
+    """
+    encoded = _search_encoding(commands)
+    if parity and encoded.stats.fits and encoded.frames:
+        encoded.parity_frames = build_parity_frames(encoded.frames)
+        encoded.stats.parity_frame_count = len(encoded.parity_frames)
+    return encoded
+
+
+def _search_encoding(commands: Sequence[VectorCommand]) -> EncodedImage:
     """Encode with the highest local-space precision that fits ten messages.
 
     Images without eligible local groups take the direct path. For local SVG
@@ -2150,6 +3175,14 @@ def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
     The first fitting candidate wins; if none fit, the smallest/last candidate
     is returned so the GUI can report an honest over-limit result.
     """
+    # Geometry selection -- per-object simplification tolerance and shape
+    # refitting -- is independent of local-coordinate precision, so it runs
+    # once here rather than inside every rung of the ladder below. It must
+    # happen before the early return too, or images without local groups would
+    # skip it entirely.
+    prepared = [command.clone() for command in prepare_geometry(commands)]
+    commands = prepared
+
     # Keep as much local-coordinate precision as the ten-message budget allows.
     # The chosen precision depends on geometry complexity, never on displayed
     # scale, so resizing the same SVG leaves its payload and frame count stable.
@@ -2184,77 +3217,337 @@ def encode_image(commands: Sequence[VectorCommand]) -> EncodedImage:
 
 
 def decode_frames(frames: Sequence[str]) -> List[VectorCommand]:
-    """Validate, reassemble, and decompress a complete protocol-6 frame set.
+    """Validate, reassemble, and decompress a received frame set.
 
-    Integrity of an individual message is MeshCore's job. What is checked here
-    is everything MeshCore cannot see: that the frames belong to one image,
-    that none are missing or contradictory, and that the reassembled stream
-    matches its CRC-32.
+    Any mix of data and parity frames is accepted; up to two missing frames are
+    rebuilt from parity. Integrity of an individual message is MeshCore's job.
+    What is checked here is everything MeshCore cannot see: that the frames
+    belong to one image, that none are missing or contradictory, and that the
+    reassembled stream matches its CRC-32.
     """
-    parts: Dict[int, str] = {}
-    image_id: Optional[str] = None
-    final_index: Optional[int] = None
-    frame_mode: Optional[int] = None
-
-    for frame in frames:
-        frame = frame.strip()
-        if len(frame) < FRAME_HEADER_LEN or len(frame) > MESSAGE_LEN:
-            raise FrameError("Invalid frame length.")
-        head, payload = frame[:FRAME_HEADER_LEN], frame[FRAME_HEADER_LEN:]
-        if head[:3] != FRAME_MAGIC:
-            raise FrameError("Wrong frame magic.")
-        if dec62(head[3]) != PROTOCOL_VERSION:
-            raise FrameError(
-                f"Frame declares protocol {dec62(head[3])}; expected {PROTOCOL_VERSION}.")
-
-        iid = head[4:7]
-        part = dec62(head[7])
-        mode = 1 if part >= 2 * MAX_MESSAGES else 0
-        part -= 2 * MAX_MESSAGES * mode
-        final = part >= MAX_MESSAGES
-        index = part - MAX_MESSAGES if final else part
-        if frame_mode is None:
-            frame_mode = mode
-        elif frame_mode != mode:
-            raise FrameError("Frames disagree about the coding mode.")
-        if not 0 <= index < MAX_MESSAGES:
-            raise FrameError("Frame index is outside the transport profile.")
-
-        # Chunking fills every frame except the last, so a non-final frame
-        # that is not exactly full has been truncated or concatenated.
-        if not final and len(payload) != FRAME_PAYLOAD_LEN:
-            raise FrameError(
-                f"Non-final frame {index} carries {len(payload)} payload characters; "
-                f"expected {FRAME_PAYLOAD_LEN}.")
-
-        if image_id is None:
-            image_id = iid
-        elif iid != image_id:
-            raise FrameError("Mixed image frames.")
-
-        if final:
-            if final_index is not None and final_index != index:
-                raise FrameError("Frame set declares two different final frames.")
-            final_index = index
-
-        if index in parts and parts[index] != payload:
-            raise FrameError("Conflicting duplicate frame.")
-        parts[index] = payload
-
-    if final_index is None:
-        raise FrameError("Frame set has no final frame; parts are missing.")
-    expected = set(range(final_index + 1))
-    if set(parts) != expected:
-        missing = sorted(expected - set(parts))
-        raise FrameError(f"Missing frame parts: {missing}.")
-
-    raw = base91_decode("".join(parts[i] for i in range(final_index + 1)))
+    assembled = reassemble_frames(frames)
+    payloads = [f[FRAME_HEADER_LEN:] for f in assembled.frames]
+    raw = base91_decode("".join(payloads))
     if len(raw) < 4:
         raise FrameError("Stream too short.")
     data, crc = raw[:-4], int.from_bytes(raw[-4:], "big")
     if zlib.crc32(data) != crc:
         raise FrameError("Stream CRC-32 mismatch.")
-    return decode_commands(data, frame_mode if frame_mode is not None else 1)[0]
+    if image_id_for(raw) != assembled.image_id:
+        raise FrameError("Stream does not match its image id; frames from different images were mixed.")
+    return decode_commands(data, assembled.mode)[0]
+
+
+
+# ===========================================================================
+# Multi-image receive: sorting interleaved frames into sets
+# ===========================================================================
+#
+# On a shared channel, messages from several images -- from several stations,
+# or several images from one station -- arrive interleaved, out of order, with
+# duplicates, gaps, and unrelated traffic. FrameSorter takes them one at a time
+# and keeps each image's set apart by its image id, decoding each image as soon
+# as enough of its messages have arrived: all k data frames, or any k of the
+# k + 2 when parity is present.
+#
+# Guarantees:
+#
+#   * An image is only ever reported once its stream passes CRC-32 *and*
+#     hashes to its own image id, so frames from two images cannot be mixed
+#     into one result.
+#   * Identical frames -- duplicates, or the same image sent by two stations --
+#     merge silently, before and after the image completes.
+#   * If two different images ever share an id, their frames are kept, and
+#     each candidate assembly is tried until one proves itself; the frames it
+#     used are taken out and the remainder carries on as the other image.
+#   * Garbage never raises. Unparseable text is counted and dropped.
+#   * Memory is bounded: pending sets, frames per set, and remembered
+#     completed images are all capped, oldest first.
+#
+# Timing policy -- how long an incomplete set may wait -- belongs to the
+# channel layer, so the sorter only offers expire(older_than); it never
+# decides on its own that a set is abandoned.
+
+SORTER_MAX_PENDING = 64
+SORTER_MAX_FRAMES_PER_SET = 4 * (MAX_MESSAGES + PARITY_FRAMES)
+SORTER_MAX_COMPLETED = 256
+SORTER_COMBINATION_LIMIT = 512   # new candidate assemblies tried per arriving frame
+SORTER_TRIED_MEMORY = 8192       # failed assemblies remembered per set
+
+
+@dataclass
+class DecodedImage:
+    """One image the sorter has completed and decoded."""
+
+    image_id: str
+    commands: List[VectorCommand]
+    frames: List[str]
+    recovered: List[int]
+    k: int
+    parity_received: int
+    first_seen: float
+    completed_at: float
+
+
+@dataclass
+class SetStatus:
+    """Progress of one incomplete image set."""
+
+    image_id: str
+    k: Optional[int]
+    data_received: List[int]
+    parity_received: int
+    frames_held: int
+    first_seen: float
+    last_seen: float
+    conflicting: bool
+
+    @property
+    def missing(self) -> Optional[List[int]]:
+        if self.k is None:
+            return None
+        return [j for j in range(self.k) if j not in self.data_received]
+
+    @property
+    def recoverable_now(self) -> bool:
+        """True when what has arrived should be enough to decode."""
+        missing = self.missing
+        return missing is not None and len(missing) <= self.parity_received
+
+    def describe(self) -> str:
+        if self.k is None:
+            return (f"{self.image_id}: {len(self.data_received)} data frame(s), "
+                    f"{self.parity_received} parity; total unknown until the final "
+                    f"frame or a parity frame arrives")
+        parts = ", ".join(str(j + 1) for j in self.missing) or "none"
+        note = "; conflicting frames share this id" if self.conflicting else ""
+        return (f"{self.image_id}: {len(self.data_received)}/{self.k} data + "
+                f"{self.parity_received}/{PARITY_FRAMES} parity, missing part(s) {parts}{note}")
+
+
+@dataclass
+class _Pool:
+    first_seen: float
+    last_seen: float
+    frames: Dict[str, Any] = field(default_factory=dict)  # frame text -> parsed
+    tried: set = field(default_factory=set)  # frozensets of frames already disproved
+
+
+class FrameSorter:
+    """Sort interleaved frames from many images into sets and decode each."""
+
+    def __init__(self, max_pending: int = SORTER_MAX_PENDING,
+                 max_frames_per_set: int = SORTER_MAX_FRAMES_PER_SET,
+                 max_completed: int = SORTER_MAX_COMPLETED) -> None:
+        self.max_pending = max_pending
+        self.max_frames_per_set = max_frames_per_set
+        self.max_completed = max_completed
+        self._pending: Dict[str, _Pool] = {}
+        self._completed: Dict[str, List[set]] = {}  # id -> expected frame sets
+        self.duplicates = 0
+        self.rejected = 0
+        self.evicted: List[SetStatus] = []
+
+    # ------------------------------------------------------------------ input
+    def add(self, frame: str, now: Optional[float] = None) -> List[DecodedImage]:
+        """Accept one received message. Returns any images it completed."""
+        now = time.time() if now is None else now
+        text = frame.strip()
+        try:
+            parsed = _parse_frame(text)
+        except MCIError:
+            self.rejected += 1
+            return []
+        image_id = parsed.image_id
+        if any(text in expected for expected in self._completed.get(image_id, ())):
+            self.duplicates += 1
+            return []
+        pool = self._pending.get(image_id)
+        if pool is None:
+            pool = self._pending[image_id] = _Pool(now, now)
+        pool.last_seen = now
+        if text in pool.frames:
+            self.duplicates += 1
+            return []
+        if len(pool.frames) >= self.max_frames_per_set:
+            self.rejected += 1
+            return []
+        pool.frames[text] = parsed
+        completed = self._complete(image_id, now)
+        self._enforce_pending_limit()
+        return completed
+
+    def add_many(self, frames: Sequence[str], now: Optional[float] = None) -> List[DecodedImage]:
+        out: List[DecodedImage] = []
+        for frame in frames:
+            out.extend(self.add(frame, now))
+        return out
+
+    # ------------------------------------------------------------------ state
+    def pending(self) -> List[SetStatus]:
+        """Every incomplete set, oldest first."""
+        return [self._status(i, p) for i, p in
+                sorted(self._pending.items(), key=lambda item: item[1].first_seen)]
+
+    def expire(self, older_than: float) -> List[SetStatus]:
+        """Drop incomplete sets not heard from since ``older_than``."""
+        stale = [i for i, p in self._pending.items() if p.last_seen < older_than]
+        dropped = [self._status(i, self._pending[i]) for i in stale]
+        for image_id in stale:
+            del self._pending[image_id]
+        return dropped
+
+    # ---------------------------------------------------------------- internals
+    def _status(self, image_id: str, pool: _Pool) -> SetStatus:
+        candidates = self._candidates(pool)
+        conflicting = len(candidates) > 1 or self._has_slot_conflict(pool)
+        if candidates:
+            k, mode = max(candidates, key=lambda km: self._support(pool, *km))
+            data = sorted({f.index for f in pool.frames.values()
+                           if isinstance(f, _DataFrame) and f.mode == mode and f.index < k
+                           and f.final == (f.index == k - 1)})
+            parity = len({f.which for f in pool.frames.values()
+                          if isinstance(f, _ParityFrame) and f.k == k and f.mode == mode})
+        else:
+            k = None
+            data = sorted({f.index for f in pool.frames.values() if isinstance(f, _DataFrame)})
+            parity = 0
+        return SetStatus(image_id, k, data, parity, len(pool.frames),
+                         pool.first_seen, pool.last_seen, conflicting)
+
+    @staticmethod
+    def _candidates(pool: _Pool) -> List[Tuple[int, int]]:
+        """(k, mode) pairs that the frames held could belong to."""
+        out = set()
+        for f in pool.frames.values():
+            if isinstance(f, _DataFrame) and f.final:
+                out.add((f.index + 1, f.mode))
+            elif isinstance(f, _ParityFrame):
+                out.add((f.k, f.mode))
+        return sorted(out)
+
+    @staticmethod
+    def _has_slot_conflict(pool: _Pool) -> bool:
+        seen = set()
+        for f in pool.frames.values():
+            slot = ("d", f.index, f.final, f.mode) if isinstance(f, _DataFrame) else ("p", f.which, f.k, f.mode)
+            if slot in seen:
+                return True
+            seen.add(slot)
+        return False
+
+    @staticmethod
+    def _support(pool: _Pool, k: int, mode: int) -> int:
+        return sum(1 for f in pool.frames.values()
+                   if f.mode == mode and (
+                       (isinstance(f, _DataFrame) and f.index < k and f.final == (f.index == k - 1))
+                       or (isinstance(f, _ParityFrame) and f.k == k)))
+
+    def _complete(self, image_id: str, now: float) -> List[DecodedImage]:
+        """Decode every image the pool can now prove, peeling each one out."""
+        done: List[DecodedImage] = []
+        while True:
+            pool = self._pending.get(image_id)
+            if pool is None:
+                return done
+            result = self._try_pool(image_id, pool, now)
+            if result is None:
+                return done
+            image, expected = result
+            for frame in [f for f in pool.frames if f in expected]:
+                del pool.frames[frame]
+            if not pool.frames:
+                del self._pending[image_id]
+            self._remember(image_id, expected)
+            done.append(image)
+
+    def _try_pool(self, image_id: str, pool: _Pool, now: float):
+        for k, mode in sorted(self._candidates(pool), key=lambda km: -self._support(pool, *km)):
+            data_slots: List[List[str]] = [[] for _ in range(k)]
+            parity_slots: List[List[str]] = [[], []]
+            for text, f in pool.frames.items():
+                if f.mode != mode:
+                    continue
+                if isinstance(f, _DataFrame):
+                    if f.index < k and f.final == (f.index == k - 1):
+                        data_slots[f.index].append(text)
+                elif f.k == k:
+                    parity_slots[f.which].append(text)
+            for choice in self._assemblies(data_slots, parity_slots, pool.tried):
+                try:
+                    assembled = reassemble_frames(list(choice))
+                    commands = decode_frames(assembled.frames)
+                except MCIError:
+                    # A wrong assembly stays wrong, so never pay for it twice.
+                    if len(pool.tried) >= SORTER_TRIED_MEMORY:
+                        pool.tried.clear()
+                    pool.tried.add(frozenset(choice))
+                    continue
+                expected = set(assembled.frames) | set(build_parity_frames(assembled.frames))
+                parity_used = sum(1 for text in choice if text.startswith(PARITY_MAGIC) and text in expected)
+                image = DecodedImage(image_id, commands, assembled.frames, assembled.recovered,
+                                     assembled.k, parity_used, pool.first_seen, now)
+                return image, expected
+        return None
+
+    @staticmethod
+    def _assemblies(data_slots: List[List[str]], parity_slots: List[List[str]], tried: set):
+        """Candidate frame sets for one (k, mode), most-complete first.
+
+        Without collisions every slot holds at most one frame and the first
+        candidate is the answer. With two images sharing an id, a slot can hold
+        a frame that belongs to the *other* image, so the search must also try
+        leaving held frames out and rebuilding those parts from parity. A held
+        frame from the wrong image makes the whole set fail its CRC and id
+        check, so every candidate is proven or discarded, never trusted.
+
+        When every data slot is filled, parity cannot change the answer, so no
+        parity frames are enumerated for those candidates. Assemblies already
+        disproved are skipped, and new attempts are capped per call, so a set
+        flooded with conflicting frames costs bounded time per arriving frame.
+        """
+        k = len(data_slots)
+        forced = [j for j in range(k) if not data_slots[j]]
+        optional = [j for j in range(k) if data_slots[j]]
+        parity_options = [slot + [None] for slot in parity_slots]
+        attempts = 0
+        for extra in range(0, PARITY_FRAMES - len(forced) + 1):
+            for dropped in itertools.combinations(optional, extra):
+                absent = set(forced) | set(dropped)
+                if absent:
+                    parity_choices = [[f for f in c if f is not None]
+                                      for c in itertools.product(*parity_options)]
+                    parity_choices = [c for c in parity_choices if len(c) >= len(absent)]
+                else:
+                    parity_choices = [[]]
+                present = [data_slots[j] for j in range(k) if j not in absent]
+                for chosen_parity in parity_choices:
+                    for data_choice in itertools.product(*present):
+                        candidate = list(data_choice) + chosen_parity
+                        if frozenset(candidate) in tried:
+                            continue
+                        attempts += 1
+                        if attempts > SORTER_COMBINATION_LIMIT:
+                            return
+                        yield candidate
+
+    def _remember(self, image_id: str, expected: set) -> None:
+        self._completed.setdefault(image_id, []).append(expected)
+        self._completed[image_id] = self._completed.pop(image_id)  # most recent last
+        while len(self._completed) > self.max_completed:
+            del self._completed[next(iter(self._completed))]
+
+    def _enforce_pending_limit(self) -> None:
+        while len(self._pending) > self.max_pending:
+            oldest = min(self._pending, key=lambda i: self._pending[i].last_seen)
+            self.evicted.append(self._status(oldest, self._pending.pop(oldest)))
+
+
+def sort_and_decode(frames: Sequence[str]) -> Tuple[List[DecodedImage], List[SetStatus], FrameSorter]:
+    """Decode every complete image in a batch of frames, e.g. a channel log."""
+    sorter = FrameSorter()
+    images = sorter.add_many(frames, now=0.0)
+    return images, sorter.pending(), sorter
 
 
 # ===========================================================================
@@ -2270,6 +3563,7 @@ __all__ = [
     "COMPRESSION_BUILD", "PROTOCOL_VERSION",
     # transport profile
     "MAX_MESSAGES", "MESSAGE_LEN", "FRAME_HEADER_LEN", "FRAME_PAYLOAD_LEN",
+    "IMAGE_ID_LEN", "IMAGE_ID_SPACE", "image_id_for",
     "MAX_PAYLOAD_CHARS", "FRAME_MAGIC", "MAX_COMMANDS", "MAX_PALETTE",
     "BASE62", "BASE91", "BASE91_INDEX",
     # record tags and precision
@@ -2279,8 +3573,11 @@ __all__ = [
     "FrameError",
     "MCIError",                                                     # (model)
     # palette and transport quantization
-    "build_palette", "geom_translation",
+    "build_palette", "merge_palette", "PALETTE_MERGE_DISTANCE",
+    "geom_translation",
     "simplify_commands", "SIMPLIFY_TOLERANCE",
+    "refit_candidates", "refit_commands", "REFIT_TOLERANCE",
+    "simplify_rate_distortion", "TOLERANCE_LADDER", "prepare_geometry",
     "apply_symmetry", "geom_symmetry", "SYMMETRY_MATRICES", "SYMMETRY_NAMES",
     # results
     "CodecStats", "EncodedImage",
@@ -2288,6 +3585,11 @@ __all__ = [
     "encode_image", "decode_frames", "encode_commands", "decode_commands",
     # framing primitives (used by frame-repair tooling)
     "base91_encode", "base91_decode", "enc62", "dec62",
+    # erasure parity
+    "PARITY_MAGIC", "PARITY_FRAMES", "PARITY_P", "PARITY_Q",
+    "build_parity_frames", "reassemble_frames", "Reassembly",
+    # multi-image receive
+    "FrameSorter", "DecodedImage", "SetStatus", "sort_and_decode",
     # the model module itself, for callers that want it directly
     "model", "load_model",
     # re-exported model vocabulary                                  # (model)

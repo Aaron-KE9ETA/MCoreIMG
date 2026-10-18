@@ -71,7 +71,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
-RECONSTRUCTOR_BUILD = "2026.08.05-reconstructor-v6.0-SLIMHEADER"
+RECONSTRUCTOR_BUILD = "2026.10.17-reconstructor-v7.1-CHANNEL120"
 
 COMPRESSION_FILENAME = "MCoreIMG-compression.py"
 CONSTRUCTOR_FILENAME = "MCoreIMG-Constructor.py"
@@ -92,8 +92,13 @@ class ReconstructorError(RuntimeError):
 
 BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 FRAME_MAGIC = "MCI"
+PARITY_MAGIC = "MCP"
+# Protocol 7 dropped the header version field: the magic strings name the frame
+# format. A future format changes the magic, and this constant with it.
+MAGIC_PROTOCOL = 7
+IMAGE_ID_LEN = 4
 DEFAULT_FRAME_HEADER_LEN = 8
-DEFAULT_MESSAGE_LEN = 150
+DEFAULT_MESSAGE_LEN = 120
 
 
 # ===========================================================================
@@ -183,6 +188,9 @@ def load_core(compression: Optional[str] = None,
     # The bootstrap frame constants above are used before this point. Confirm
     # they agree with the codec so a profile change cannot pass unnoticed.
     for name, local in (("FRAME_MAGIC", FRAME_MAGIC),
+                        ("PARITY_MAGIC", PARITY_MAGIC),
+                        ("PROTOCOL_VERSION", MAGIC_PROTOCOL),
+                        ("IMAGE_ID_LEN", IMAGE_ID_LEN),
                         ("BASE62", BASE62),
                         ("FRAME_HEADER_LEN", DEFAULT_FRAME_HEADER_LEN),
                         ("MESSAGE_LEN", DEFAULT_MESSAGE_LEN)):
@@ -226,6 +234,8 @@ class DecodedAsset:
     protocol: int
     frames: Optional[list] = None
     document: Any = None
+    recovered: Optional[list] = None
+    image_id: Optional[str] = None
 
 
 # ==========================================================================
@@ -253,53 +263,68 @@ def decode_base62(text: str) -> int:
 
 
 def frame_protocol_version(frame: str) -> int:
-    """Read the one-character protocol version from an MCI frame.
+    """Return the protocol a frame belongs to.
 
-    The transport header is authoritative for selecting a Constructor core.
-    Filename and build-string heuristics are used only to rank cores that have
-    already declared the required protocol.
+    Since protocol 7 the magic string itself names the frame format, so a
+    recognised magic implies MAGIC_PROTOCOL.
     """
     frame = frame.strip()
-    if len(frame) < 4 or not frame.startswith(FRAME_MAGIC):
-        raise ReconstructorError("Cannot determine protocol from malformed MCI frame.")
-    return decode_base62(frame[3])
+    if not frame.startswith((FRAME_MAGIC, PARITY_MAGIC)):
+        raise ReconstructorError("Not an MCoreIMG frame.")
+    return MAGIC_PROTOCOL
 
 
 def _frame_length_at(text: str, start: int) -> Optional[int]:
-    """Calculate a complete frame length from the 8-character protocol-6 header.
+    """Calculate a complete frame length from an 8-character protocol-7 header.
 
-    Protocol 6 dropped the payload-length field, because chunking fills every
-    frame except the last: a non-final frame is always exactly MESSAGE_LEN
-    characters, and the final frame simply runs to the end of the line.
+    Data frames ("MCI"): chunking fills every frame except the last, so a
+    non-final frame is exactly MESSAGE_LEN characters and the final frame runs
+    to the end of the line.
+
+    Parity frames ("MCP"): the descriptor carries the data frame count k. With
+    k > 1 parity is as long as a full data frame, so the frame is exactly
+    MESSAGE_LEN; with k = 1 it matches the single data frame and runs to the
+    end of the line.
 
     Returning ``None`` means the text at ``start`` is not safely parseable,
     which keeps ordinary chat text beginning with "MCI" from being consumed.
     """
-    if text[start:start + 3] != FRAME_MAGIC:
+    magic = text[start:start + 3]
+    if magic not in (FRAME_MAGIC, PARITY_MAGIC):
         return None
     if len(text) - start < DEFAULT_FRAME_HEADER_LEN:
         return None
     header = text[start:start + DEFAULT_FRAME_HEADER_LEN]
     try:
-        decode_base62(header[3])          # protocol
-        part = decode_base62(header[7])   # index + final flag + coding mode
+        decode_base62(header[3:3 + IMAGE_ID_LEN])   # image id
+        descriptor = decode_base62(header[-1])
     except ReconstructorError:
         return None
-    if part >= 40:
+    if descriptor >= 40:
         return None
-    final = (part % 20) >= 10
-    if not final:
+    if magic == PARITY_MAGIC:
+        runs_to_end = (descriptor % 20) // 2 + 1 == 1
+    else:
+        runs_to_end = (descriptor % 20) >= 10   # final data frame
+    if not runs_to_end:
         total = DEFAULT_MESSAGE_LEN
         return total if start + total <= len(text) else None
-    # Final frame: consume the rest of the line, bounded by the envelope.
     total = len(text) - start
     if total < DEFAULT_FRAME_HEADER_LEN or total > DEFAULT_MESSAGE_LEN:
         return None
     return total
 
 
+def _next_magic(line: str, cursor: int) -> int:
+    hits = [i for i in (line.find(FRAME_MAGIC, cursor), line.find(PARITY_MAGIC, cursor)) if i >= 0]
+    return min(hits) if hits else -1
+
+
 def extract_frames(text: str) -> list[str]:
-    """Extract unique complete MCI frames from exports or copied chat transcripts.
+    """Extract unique complete data and parity frames from exports or transcripts.
+
+    The frames may belong to any number of images; sorting them into sets is
+    the codec's FrameSorter's job, not this scanner's.
 
     Non-final frames are fixed length, so they can be sliced out of a line
     containing several.  A final frame runs to the end of its line.  A
@@ -314,7 +339,7 @@ def extract_frames(text: str) -> list[str]:
         cursor = 0
         found = False
         while True:
-            start = line.find(FRAME_MAGIC, cursor)
+            start = _next_magic(line, cursor)
             if start < 0:
                 break
             length = _frame_length_at(line, start)
@@ -329,7 +354,8 @@ def extract_frames(text: str) -> list[str]:
 
         # Fallback for development frame variants whose payload-length field
         # moved while retaining one frame per line.
-        if not found and line.startswith(FRAME_MAGIC) and not any(char.isspace() for char in line):
+        if (not found and line.startswith((FRAME_MAGIC, PARITY_MAGIC))
+                and not any(char.isspace() for char in line)):
             frames.append(line)
 
     unique: list[str] = []
@@ -339,14 +365,7 @@ def extract_frames(text: str) -> list[str]:
             seen.add(frame)
             unique.append(frame)
     if not unique:
-        raise ReconstructorError("No MCoreIMG frames beginning with 'MCI' were found.")
-
-    versions = {frame_protocol_version(frame) for frame in unique}
-    if len(versions) != 1:
-        raise ReconstructorError(
-            "Input contains mixed MCoreIMG protocol versions: "
-            + ", ".join(map(str, sorted(versions)))
-        )
+        raise ReconstructorError("No MCoreIMG frames beginning with 'MCI' or 'MCP' were found.")
     return unique
 
 
@@ -527,19 +546,44 @@ def command_to_json(command: Any) -> dict[str, Any]:
 # ===========================================================================
 
 
-def decode_asset(core: Core, path: Path, frames: Optional[list]) -> DecodedAsset:
-    """Decode transport frames, or load an editable/SVG source file."""
+def decode_assets(core: Core, path: Path, frames: Optional[list]):
+    """Decode every image in the input.
+
+    A transport input may hold frames from any number of images, interleaved,
+    as a channel log would. They are sorted into per-image sets by image id and
+    each complete set is decoded independently. Returns (assets, incomplete),
+    where incomplete lists the sets that could not be completed.
+    """
     if frames is not None:
-        try:
-            commands = core.compression.decode_frames(frames)
-        except core.compression.MCIError as exc:
-            raise ReconstructorError(f"Frame decoding failed: {exc}") from exc
-        return DecodedAsset(
-            commands=list(commands),
-            source_description=f"{len(frames)} transport frame(s) from {path.name}",
-            protocol=core.protocol,
-            frames=list(frames),
-        )
+        mci = core.compression
+        images, incomplete, sorter = mci.sort_and_decode(frames)
+        assets = []
+        present = {f.strip() for f in frames}
+        for image in images:
+            # Report what the input held for this image, not just what the
+            # sorter needed: it completes as soon as it can, so parity frames
+            # later in the input arrive as duplicates of a finished image.
+            received = image.k - len(image.recovered)
+            parity_held = sum(1 for f in mci.build_parity_frames(image.frames) if f in present)
+            description = (f"image {image.image_id}: {received}/{image.k} data + "
+                           f"{parity_held}/{mci.PARITY_FRAMES} parity frame(s)")
+            if image.recovered:
+                parts = ", ".join(str(j + 1) for j in image.recovered)
+                description += f"; rebuilt part(s) {parts} from parity"
+            assets.append(DecodedAsset(
+                commands=list(image.commands),
+                source_description=description,
+                protocol=core.protocol,
+                frames=list(image.frames),
+                recovered=list(image.recovered),
+                image_id=image.image_id,
+            ))
+        notes = []
+        if sorter.rejected:
+            notes.append(f"{sorter.rejected} frame-like line(s) could not be parsed and were skipped")
+        if sorter.duplicates:
+            notes.append(f"{sorter.duplicates} duplicate frame(s) merged")
+        return assets, incomplete, notes
 
     ctor = core.require_constructor()
     try:
@@ -547,12 +591,26 @@ def decode_asset(core: Core, path: Path, frames: Optional[list]) -> DecodedAsset
     except Exception as exc:
         raise ReconstructorError(f"Cannot load source file {path.name}: {exc}") from exc
     commands = document.transformed_commands()
-    return DecodedAsset(
+    asset = DecodedAsset(
         commands=list(commands),
         source_description=f"source document {path.name} ({len(commands)} command(s))",
         protocol=core.protocol,
         document=document,
     )
+    return [asset], [], []
+
+
+def decode_asset(core: Core, path: Path, frames: Optional[list]) -> DecodedAsset:
+    """Decode a single-image input, failing clearly if it holds anything else."""
+    assets, incomplete, _notes = decode_assets(core, path, frames)
+    if len(assets) == 1 and not incomplete:
+        return assets[0]
+    if not assets:
+        detail = "; ".join(status.describe() for status in incomplete) or "no complete image"
+        raise ReconstructorError(f"Frame decoding failed: {detail}")
+    raise ReconstructorError(
+        f"Input holds {len(assets)} decodable image(s) and {len(incomplete)} incomplete set(s); "
+        "use decode_assets for multi-image input.")
 
 
 def render_asset(core: Core, asset: DecodedAsset):
@@ -677,8 +735,63 @@ def run_self_test(core: Core) -> None:
         assert image.size == (mci.CANVAS_W, mci.CANVAS_H), "rendered size is not the canvas size"
         checks += 1
 
+    # 7. RAID 6 parity: any one or two of the k + 2 messages may be lost.
+    import itertools
+    import random
+    rng = random.Random(6)
+    shapes = [
+        mci.VectorCommand(mci.OP_RECT, mci.PaintStyle(rng.choice(["#204060", "#C0A080", "#FF0000"]), None, 1.0),
+                          {"x": rng.randrange(600), "y": rng.randrange(400),
+                           "w": rng.randrange(2, 90), "h": rng.randrange(2, 70)})
+        for _ in range(60)
+    ]
+    big = mci.encode_image(shapes)
+    assert big.stats.fits and len(big.frames) >= 3, "parity self-test image should span several frames"
+    assert len(big.parity_frames) == mci.PARITY_FRAMES, "encoder did not emit parity frames"
+    sent = big.transmit_frames
+    expected = [c.to_json() for c in mci.decode_frames(big.frames)]
+    for lost in itertools.chain(itertools.combinations(range(len(sent)), 1),
+                                itertools.combinations(range(len(sent)), 2)):
+        received = [f for i, f in enumerate(sent) if i not in lost]
+        rng.shuffle(received)
+        got = [c.to_json() for c in mci.decode_frames(received)]
+        assert got == expected, f"parity recovery failed with messages {lost} lost"
+    checks += 1
+
+    # 8. Three losses exceed RAID 6 and must be refused, never mis-decoded.
+    for lost in itertools.combinations(range(len(sent)), 3):
+        try:
+            mci.decode_frames([f for i, f in enumerate(sent) if i not in lost])
+        except mci.MCIError:
+            continue
+        raise AssertionError(f"decoded with three messages {lost} lost")
+    checks += 1
+
+    # 9. Parity frames are found in pasted text, including several per line.
+    pasted = "chat noise MCI not a frame\n" + "".join(sent[:3]) + "\n" + "\n".join(sent[3:]) + "\n"
+    assert sorted(extract_frames(pasted)) == sorted(sent), "frame scan missed data or parity frames"
+    checks += 1
+
+    # 10. Several images interleaved on one channel decode separately.
+    others = [mci.encode_image(shapes[i::3]) for i in range(3)]
+    channel = []
+    for index, other in enumerate(others):
+        sent_other = other.transmit_frames
+        channel += [f for i, f in enumerate(sent_other) if i != index]  # each loses one message
+    channel += channel[:2]                                               # and re-sends happen
+    rng.shuffle(channel)
+    images, incomplete, _sorter = mci.sort_and_decode(channel + ["chat noise", "MCI short"])
+    assert not incomplete, "an interleaved image was left incomplete"
+    by_id = {image.image_id: [c.to_json() for c in image.commands] for image in images}
+    assert len(by_id) == len(others), "interleaved images were not kept apart"
+    for other in others:
+        assert by_id[other.image_id] == [c.to_json() for c in mci.decode_frames(other.frames)], \
+            "an interleaved image decoded wrongly"
+    checks += 1
+
     print(f"MCoreIMG Reconstructor self-test: PASS ({checks} checks)")
-    print(f"protocol={core.protocol} frames={len(encoded.frames)} commands={len(decoded)}")
+    print(f"protocol={core.protocol} frames={len(encoded.frames)} commands={len(decoded)} "
+          f"parity_patterns={len(sent) + len(sent) * (len(sent) - 1) // 2}")
 
 
 # ===========================================================================
@@ -768,7 +881,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         core = load_core(args.compression, args.constructor,
                          need_renderer=not args.no_render)
 
+        # Only transport frames are bound to a wire protocol. An editable source
+        # file is commands in JSON; its protocol_version records where it came
+        # from and does not stop it rendering under a newer codec.
         required = args.protocol if args.protocol is not None else detected_protocol
+        if frames is None and args.protocol is None:
+            required = None
         if required is not None and required != core.protocol:
             raise ReconstructorError(
                 f"Input needs protocol {required}, but the codec beside this file is "
@@ -776,40 +894,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"  Codec: {core.compression_path}\n"
                 "Pair this Reconstructor with the matching codec, or pass --compression.")
 
-        asset = decode_asset(core, input_path, frames)
+        assets, incomplete, notes = decode_assets(core, input_path, frames)
 
         print(f"MCoreIMG Reconstructor {RECONSTRUCTOR_BUILD}")
         _print_core(core)
-        print(f"Loaded: {asset.source_description}")
-        print(f"Decoded commands: {len(asset.commands)}")
+        if frames is not None:
+            print(f"Input: {len(frames)} frame(s) from {input_path.name}, "
+                  f"{len(assets)} image(s) decoded, {len(incomplete)} incomplete")
+        for note in notes:
+            print(f"Note: {note}")
+        for status in incomplete:
+            print(f"Incomplete: {status.describe()}", file=sys.stderr)
+        if not assets:
+            raise ReconstructorError("No complete image could be decoded from the input.")
 
-        if args.list_commands:
-            list_commands(asset, core.compression.OP_NAMES)
+        many = len(assets) > 1
+        base_output = (Path(args.output).expanduser().resolve()
+                       if args.output else default_output_path(input_path))
+        written = []
+        for asset in assets:
+            print(f"Loaded: {asset.source_description}")
+            print(f"Decoded commands: {len(asset.commands)}")
+            if args.list_commands:
+                list_commands(asset, core.compression.OP_NAMES)
 
-        output_path = None
-        if not args.no_render:
-            output_path = (Path(args.output).expanduser().resolve()
-                           if args.output else default_output_path(input_path))
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            image = render_asset(core, asset)
-            try:
-                image.save(output_path)
-                size, mode = image.size, image.mode
-            finally:
-                close = getattr(image, "close", None)
-                if callable(close):
-                    close()
-            print(f"PNG: {size[0]}x{size[1]} {mode}")
-            print(f"Image reconstruction complete: {output_path}")
+            # Several images share one base name, told apart by image id.
+            output_path = base_output
+            if many:
+                output_path = base_output.with_name(f"{base_output.stem}-{asset.image_id}{base_output.suffix}")
+            if not args.no_render:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                image = render_asset(core, asset)
+                try:
+                    image.save(output_path)
+                    size, mode = image.size, image.mode
+                finally:
+                    close = getattr(image, "close", None)
+                    if callable(close):
+                        close()
+                print(f"PNG: {size[0]}x{size[1]} {mode}")
+                print(f"Image reconstruction complete: {output_path}")
+                written.append(output_path)
 
-        if args.dump_json:
-            base = output_path if output_path else input_path
-            json_path = base.with_suffix(".mci.json")
-            dump_source_json(core, asset, input_path, json_path)
-            print(f"Decoded source JSON: {json_path}")
+            if args.dump_json:
+                base = output_path if not args.no_render else (
+                    input_path.with_name(f"{input_path.stem}-{asset.image_id}") if many else input_path)
+                json_path = base.with_suffix(".mci.json")
+                dump_source_json(core, asset, input_path, json_path)
+                print(f"Decoded source JSON: {json_path}")
 
-        if output_path and not args.no_open:
-            open_output(output_path)
+        # Opening one viewer is helpful; opening one per image in a channel log is not.
+        if len(written) == 1 and not args.no_open:
+            open_output(written[0])
+        elif len(written) > 1 and not args.no_open:
+            print(f"Wrote {len(written)} images; not opening them automatically.")
         return 0
 
     except ReconstructorError as exc:

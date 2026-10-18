@@ -294,8 +294,8 @@ DEFAULT_MARGIN = 8
 SOURCE_FORMAT = "MCoreIMG-SVG-source"
 SOURCE_VERSION = 6
 
-CONSTRUCTOR_BUILD = "2026.08.05-svg-v6.0-MODULAR-SLIMHEADER-10MSG"
-FEATURE_SIGNATURE = "PROTO6|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG"
+CONSTRUCTOR_BUILD = "2026.10.17-svg-v7.1-MODULAR-CHANNEL120-10+2MSG"
+FEATURE_SIGNATURE = "PROTO7|LOCALSPACE|HYBRID|PRIMITIVES|GROUPCOPY|ALPHA|UNDO|10MSG|RAID6|MULTIIMAGE"
 
 CSS_NAMED_FALLBACK = {
     "black": "#000000", "white": "#FFFFFF", "red": "#FF0000",
@@ -327,7 +327,7 @@ class VectorDocument:
 
     Individual object edits normally bake this transform first. Keeping it at
     document level is convenient for Fit/Center operations and source JSON,
-    while protocol-v5 local SVG transforms are planned later by the encoder.
+    while local-space SVG transforms are planned later by the encoder.
     """
 
     commands: List[VectorCommand] = field(default_factory=list)
@@ -1069,7 +1069,7 @@ def append_source_files(
     click-drawn primitives share the same canvas coordinate system.  Each file
     is imported using its own SVG fit-to-canvas transform, then translated by
     ``base + index * step``. Re-importing the same SVG therefore produces an
-    exact translated command group that protocol-v5 local-definition reuse can
+    exact translated command group that local-definition reuse can
     reference instead of transmitting twice.
     """
     normalized_paths = [Path(item) for item in paths]
@@ -1106,6 +1106,25 @@ def append_source_files(
 # ==========================================================================
 # GUI
 # ==========================================================================
+
+def _parity_tag(encoded) -> str:
+    """Status-bar suffix for the parity messages, which sit outside the 10-frame budget."""
+    count = len(getattr(encoded, "parity_frames", []) or [])
+    return f" +{count} parity" if count else ""
+
+
+def _insert_frame_listing(text, encoded) -> None:
+    """List data frames, then parity frames, in transmission order."""
+    total = len(encoded.transmit_frames)
+    for index, frame in enumerate(encoded.frames):
+        text.insert("end", f"Message {index + 1}/{total} — data part {index + 1}/{len(encoded.frames)} — {len(frame)} chars\n{frame}\n\n")
+    for offset, frame in enumerate(encoded.parity_frames):
+        label = "P" if offset == mci.PARITY_P else "Q"
+        number = len(encoded.frames) + offset + 1
+        text.insert("end", f"Message {number}/{total} — parity {label} — {len(frame)} chars\n{frame}\n\n")
+    if encoded.parity_frames:
+        text.insert("end", "Any two of these messages may be lost; the receiver rebuilds them from parity.\n")
+
 
 class MultiSVGPlacementDialog(tk.Toplevel):
     """One compact placement dialog for a multi-file SVG append operation."""
@@ -1280,7 +1299,7 @@ class _DocumentAppBase(tk.Tk):
             fit="fits" if enc.stats.fits else "TOO LARGE"
             alpha_colors = len({quantize_palette_color(color) for c in preview_cmds for color in (c.style.fill, c.style.stroke) if color and alpha4(color) < 15})
             alpha_tag = f" | {alpha_colors} alpha" if alpha_colors else ""
-            self.var_stats.set(f"{tag}{len(source_cmds)} cmds | {enc.stats.palette_count} colors{alpha_tag} | {enc.stats.base91_chars} chars | {enc.stats.frame_count}/{MAX_MESSAGES} frames {fit}")
+            self.var_stats.set(f"{tag}{len(source_cmds)} cmds | {enc.stats.palette_count} colors{alpha_tag} | {enc.stats.base91_chars} chars | {enc.stats.frame_count}/{MAX_MESSAGES} frames{_parity_tag(enc)} {fit}")
         except Exception as exc:
             # Rendering the raw source remains preferable to a blank canvas if
             # a malformed/oversized stream cannot be round-tripped.
@@ -1317,8 +1336,8 @@ class _DocumentAppBase(tk.Tk):
             return
         path=filedialog.asksaveasfilename(defaultextension=".mci",filetypes=[("MCoreIMG frames","*.mci"),("Text","*.txt")])
         if not path:return
-        Path(path).write_text("\n".join(enc.frames)+"\n",encoding="ascii")
-        self.var_status.set(f"Exported protocol-v{PROTOCOL_VERSION} image {enc.image_id}: {len(enc.frames)} frame(s) to {path}")
+        Path(path).write_text("\n".join(enc.transmit_frames)+"\n",encoding="ascii")
+        self.var_status.set(f"Exported protocol-v{PROTOCOL_VERSION} image {enc.image_id}: {len(enc.frames)} data + {len(enc.parity_frames)} parity frame(s) to {path}")
 
     def export_png(self):
         try:
@@ -1341,10 +1360,10 @@ class _DocumentAppBase(tk.Tk):
         except Exception as exc:messagebox.showerror("Preview failed",str(exc));return
         win=tk.Toplevel(self);win.title(f"MCoreIMG SVG Frames — {enc.image_id}");win.geometry("1000x470")
         text=tk.Text(win,wrap="none",font=("TkFixedFont",10));text.pack(fill="both",expand=True,padx=8,pady=8)
-        text.insert("end",f"Build: {CONSTRUCTOR_BUILD}\nTransport limit: {MAX_MESSAGES} messages / {MAX_PAYLOAD_CHARS} payload characters\nProtocol: {PROTOCOL_VERSION}\nPalette: {', '.join(enc.palette)}\nCommands: {enc.stats.command_count}\nTranslated repeats: {enc.stats.repeat_count}\nPayload: {enc.stats.base91_chars} chars\nFrames: {enc.stats.frame_count}/{MAX_MESSAGES}\n\n")
-        for i,f in enumerate(enc.frames):text.insert("end",f"Part {i+1}/{len(enc.frames)} — {len(f)} chars\n{f}\n\n")
+        text.insert("end",f"Build: {CONSTRUCTOR_BUILD}\nTransport limit: {MAX_MESSAGES} messages / {MAX_PAYLOAD_CHARS} payload characters\nProtocol: {PROTOCOL_VERSION}\nPalette: {', '.join(enc.palette)}\nCommands: {enc.stats.command_count}\nTranslated repeats: {enc.stats.repeat_count}\nPayload: {enc.stats.base91_chars} chars\nFrames: {enc.stats.frame_count}/{MAX_MESSAGES}{_parity_tag(enc)}\n\n")
+        _insert_frame_listing(text, enc)
         text.configure(state="disabled")
-        def copy_all():self.clipboard_clear();self.clipboard_append("\n".join(enc.frames))
+        def copy_all():self.clipboard_clear();self.clipboard_append("\n".join(enc.transmit_frames))
         ttk.Button(win,text="Copy All Frames",command=copy_all).pack(pady=(0,8))
 
     def fit_document(self):
@@ -1460,7 +1479,7 @@ class _DrawingAppBase(_DocumentAppBase):
             fit = "fits" if encoded.stats.fits else "TOO LARGE"
             prefix = "OVER CANVAS | " if outside else ""
             optimizer = f" | P:{encoded.stats.primitive_count} V:{encoded.stats.vectorized_primitive_count} G:{encoded.stats.group_repeat_count} L:{encoded.stats.local_group_extent if encoded.stats.transformed_group_count else "-"}"
-            self.var_stats.set(f"{prefix}{len(source_commands)} src / {encoded.stats.command_count} tx | {encoded.stats.base91_chars} chars | {encoded.stats.frame_count}/{MAX_MESSAGES} frames {fit}{optimizer}")
+            self.var_stats.set(f"{prefix}{len(source_commands)} src / {encoded.stats.command_count} tx | {encoded.stats.base91_chars} chars | {encoded.stats.frame_count}/{MAX_MESSAGES} frames{_parity_tag(encoded)} {fit}{optimizer}")
         except Exception as exc:
             render_to_tk(self.canvas, source_commands)
             self.var_stats.set(f"Cannot encode: {exc}")
@@ -1476,12 +1495,11 @@ class _DrawingAppBase(_DocumentAppBase):
             f"Palette: {', '.join(encoded.palette)}\nSource commands: {encoded.stats.source_command_count}\nTransport commands: {encoded.stats.command_count}\n"
             f"Compact primitives selected: {encoded.stats.primitive_count}\nPrimitives vectorized because equal/smaller: {encoded.stats.vectorized_primitive_count}\n"
             f"Single translated repeats: {encoded.stats.repeat_count - encoded.stats.group_repeat_count}\nRepeated/copied groups: {encoded.stats.group_repeat_count}\nLocal-space SVG groups: {encoded.stats.transformed_group_count}\nLocal coordinate extent: {encoded.stats.local_group_extent}\n"
-            f"Payload: {encoded.stats.base91_chars} chars\nFrames: {encoded.stats.frame_count}/{MAX_MESSAGES}\n\n"
+            f"Payload: {encoded.stats.base91_chars} chars\nFrames: {encoded.stats.frame_count}/{MAX_MESSAGES}{_parity_tag(encoded)}\n\n"
         ))
-        for index, frame in enumerate(encoded.frames):
-            text.insert("end", f"Part {index + 1}/{len(encoded.frames)} — {len(frame)} chars\n{frame}\n\n")
+        _insert_frame_listing(text, encoded)
         text.configure(state="disabled")
-        ttk.Button(window, text="Copy All Frames", command=lambda: (self.clipboard_clear(), self.clipboard_append("\n".join(encoded.frames)))).pack(pady=(0, 8))
+        ttk.Button(window, text="Copy All Frames", command=lambda: (self.clipboard_clear(), self.clipboard_append("\n".join(encoded.transmit_frames)))).pack(pady=(0, 8))
 
     def append_svg(self):
         paths = filedialog.askopenfilenames(
@@ -1667,7 +1685,7 @@ class _DrawingAppBase(_DocumentAppBase):
 
 
 class ConstructorApp(_DrawingAppBase):
-    """Protocol-v5 hybrid Constructor with direct canvas manipulation.
+    """Protocol-v6 hybrid Constructor with direct canvas manipulation.
 
     Editor-only grouping makes an imported SVG move and scale as one object,
     while the transport encoder still receives its original contiguous command
@@ -1677,7 +1695,14 @@ class ConstructorApp(_DrawingAppBase):
 
     HANDLE_SIZE = 8
 
+    # Canvas click ownership. "select" gives clicks to the direct-editing
+    # handlers; "draw" gives them to Old Drawing Mode's placement handler.
+    CANVAS_MODE_SELECT = "select"
+    CANVAS_MODE_DRAW = "draw"
+
     def __init__(self):
+        self._canvas_mode: str = self.CANVAS_MODE_SELECT
+        self._canvas_mode_var: Optional[tk.StringVar] = None
         self._editor_drag_mode: Optional[str] = None
         self._editor_last_point: Optional[Tuple[float, float]] = None
         self._editor_resize_start: Optional[Tuple[float, float]] = None
@@ -1789,16 +1814,57 @@ class ConstructorApp(_DrawingAppBase):
         )
 
     def _bind_editor_canvas(self) -> None:
+        """Take ownership of the canvas mouse bindings.
+
+        All three are bound unconditionally and :meth:`_editor_press` decides
+        who handles the click. Earlier builds bound and unbound them as Old
+        Drawing Mode opened and closed, which meant the canvas could be left in
+        a state where nothing was selectable.
+        """
         self.canvas.bind("<Button-1>", self._editor_press)
         self.canvas.bind("<B1-Motion>", self._editor_drag)
         self.canvas.bind("<ButtonRelease-1>", self._editor_release)
 
+    def _drawing_window_open(self) -> bool:
+        return self._manual_window is not None and self._manual_window.winfo_exists()
+
+    def canvas_click_target(self) -> str:
+        """Return "draw" or "select" for the next canvas click.
+
+        Placement only takes the click while the drawing window is open *and*
+        the user has left it in draw mode, so selecting and moving artwork no
+        longer requires closing the window first.
+        """
+        if self._drawing_window_open() and self._canvas_mode == self.CANVAS_MODE_DRAW:
+            return self.CANVAS_MODE_DRAW
+        return self.CANVAS_MODE_SELECT
+
+    def _set_canvas_mode(self, mode: str) -> None:
+        self._canvas_mode = (
+            self.CANVAS_MODE_DRAW if mode == self.CANVAS_MODE_DRAW else self.CANVAS_MODE_SELECT)
+        # Abandon any half-finished two-click shape when leaving draw mode.
+        if self._canvas_mode != self.CANVAS_MODE_DRAW:
+            self._manual_first_point = None
+        if self._canvas_mode_var is not None:
+            self._canvas_mode_var.set(self._canvas_mode)
+        if self._canvas_mode == self.CANVAS_MODE_DRAW:
+            self.var_status.set("Canvas: drawing mode. Clicks place shapes.")
+        else:
+            self.var_status.set("Canvas: select mode. Click artwork to move or resize it.")
+        if getattr(self, "manual_status", None) is not None:
+            self.manual_status.set(
+                "Drawing: canvas clicks place shapes."
+                if self._canvas_mode == self.CANVAS_MODE_DRAW
+                else "Select: canvas clicks select, drag moves, corner handle resizes.")
+        self._refresh()
+
     def open_drawing_mode(self):
-        # Manual drawing temporarily owns the primary canvas click. Movement
-        # bindings are disabled so a drawing gesture cannot also move artwork.
-        self.canvas.unbind("<B1-Motion>")
-        self.canvas.unbind("<ButtonRelease-1>")
+        # The base class points the canvas click at its placement handler. Take
+        # it back afterwards so _editor_press can route by mode instead, which
+        # is what lets artwork stay selectable while this window is open.
         super().open_drawing_mode()
+        self._set_canvas_mode(self.CANVAS_MODE_DRAW)
+        self._bind_editor_canvas()
         if self._manual_window is not None and self._manual_window.winfo_exists():
             self._manual_window.geometry("560x780")
             chooser_bar = ttk.Frame(self._manual_window, padding=(10, 0, 10, 8))
@@ -1806,8 +1872,25 @@ class ConstructorApp(_DrawingAppBase):
             ttk.Button(chooser_bar, text="Choose Main Color…", command=self._choose_manual_main_color).pack(side="left", padx=3)
             ttk.Button(chooser_bar, text="Choose Moon Crater Color…", command=self._choose_manual_crater_color).pack(side="left", padx=3)
 
+            mode_bar = ttk.Frame(self._manual_window, padding=(10, 0, 10, 8))
+            mode_bar.pack(fill="x")
+            ttk.Label(mode_bar, text="Canvas clicks:").pack(side="left", padx=(0, 6))
+            self._canvas_mode_var = tk.StringVar(value=self.CANVAS_MODE_DRAW)
+            ttk.Radiobutton(
+                mode_bar, text="Draw shapes", value=self.CANVAS_MODE_DRAW,
+                variable=self._canvas_mode_var,
+                command=lambda: self._set_canvas_mode(self.CANVAS_MODE_DRAW),
+            ).pack(side="left", padx=3)
+            ttk.Radiobutton(
+                mode_bar, text="Select && move", value=self.CANVAS_MODE_SELECT,
+                variable=self._canvas_mode_var,
+                command=lambda: self._set_canvas_mode(self.CANVAS_MODE_SELECT),
+            ).pack(side="left", padx=3)
+
     def _close_drawing_mode(self):
         super()._close_drawing_mode()
+        self._canvas_mode_var = None
+        self._set_canvas_mode(self.CANVAS_MODE_SELECT)
         self._bind_editor_canvas()
 
     def _choose_manual_main_color(self):
@@ -1991,7 +2074,8 @@ class ConstructorApp(_DrawingAppBase):
         self._refresh()
 
     def _editor_press(self, event):
-        if self._manual_window is not None and self._manual_window.winfo_exists():
+        if self.canvas_click_target() == self.CANVAS_MODE_DRAW:
+            self._manual_canvas_click(event)
             return
         self._bake_for_direct_edit()
         bbox = self._selection_bbox()
@@ -2072,7 +2156,7 @@ class ConstructorApp(_DrawingAppBase):
         self.selected_index = self._editor_selected_index
         self._refresh()
         self.var_status.set(
-            f"Duplicated {len(copies)} command(s). Protocol-v5 local-definition reuse remains automatic."
+            f"Duplicated {len(copies)} command(s). Protocol-v6 local-definition reuse remains automatic."
         )
 
     def duplicate_all(self):
@@ -2142,13 +2226,85 @@ def _transport_signature(command: VectorCommand) -> Dict[str, Any]:
 
 
 def run_self_test():
-    # Generic v5 round trip and alpha.
+    # Generic v6 round trip and alpha.
     base = sample_document()
     base_commands = [quantize_command(command) for command in base.commands]
     encoded = encode_image(base_commands)
     decoded = decode_frames(encoded.frames)
     assert len(decoded) == len(base_commands)
-    assert MAX_MESSAGES == 10 and MAX_PAYLOAD_CHARS == 1420
+    assert MAX_MESSAGES == 10 and MESSAGE_LEN == 120 and MAX_PAYLOAD_CHARS == 1120
+
+    # The precision ladder must be able to search downward. An image that is
+    # over budget at full local precision but fits at a coarser one has to
+    # reach that coarser rung; an earlier build raised on the first over-limit
+    # rung and aborted the search, so such images failed outright.
+    _dense = []
+    # 36 shapes: over budget at full local precision, and fitting only after the
+    # ladder has stepped down several rungs. Sized for 120-character messages;
+    # if the envelope changes, resize it so both properties still hold, because
+    # every check below depends on them.
+    for _i in range(36):
+        _angle = _i * 0.31
+        _pts = [(360 + (120 + 40 * math.sin(_angle)) * math.cos(_angle + _j * 0.7),
+                 240 + (90 + 30 * math.cos(_angle)) * math.sin(_angle + _j * 0.7))
+                for _j in range(18)]
+        _cmd = VectorCommand(OP_POLYGON, PaintStyle(f"#{(_i * 4) % 256:02X}3060", None, 1.0),
+                             {"points": _pts})
+        _cmd.editor_group = 1
+        _dense.append(_cmd)
+    _top = mci._encode_image_once(mci.prepare_geometry(_dense), mci.LOCAL_GROUP_EXTENT)
+    assert not _top.stats.fits, "ladder test image must be over budget at full precision"
+    _encoded = encode_image(_dense)
+    assert _encoded.stats.fits, "ladder test image must fit once the ladder steps down"
+    assert _encoded.stats.local_group_extent < mci.LOCAL_GROUP_EXTENT, "ladder did not step down"
+    assert _encoded.frames, "a fitting image must emit frames"
+    assert len(decode_frames(_encoded.frames)) == len(_dense), "ladder round trip lost commands"
+
+    # Untransmittable sets emit no frames rather than aliased part indices.
+    _too_big = encode_image(_dense * 2)
+    assert not _too_big.stats.fits, "doubled ladder image should not fit"
+    assert not _too_big.frames, "over-limit image must not emit addressable frames"
+    assert not _too_big.parity_frames, "over-limit image must not emit parity"
+
+    # RAID 6 parity: the two parity messages let any two of the k + 2 be lost.
+    # Exercise the hardest cases -- the final frame, which must have its length
+    # resolved, together with a data frame or each parity frame.
+    _sent = _encoded.transmit_frames
+    _k = len(_encoded.frames)
+    assert len(_encoded.parity_frames) == 2, "fitting image must carry P and Q"
+    assert all(len(f) <= MESSAGE_LEN for f in _sent), "parity frame exceeds message length"
+    _expected = [c.to_json() for c in decode_frames(_encoded.frames)]
+    for _lost in ((_k - 1,), (0, _k - 1), (_k - 1, _k), (_k - 1, _k + 1), (_k, _k + 1)):
+        _received = [f for _i, f in enumerate(_sent) if _i not in _lost]
+        assert [c.to_json() for c in decode_frames(_received)] == _expected, \
+            f"parity did not recover messages {_lost}"
+    assert encode_image(_dense, parity=False).parity_frames == [], "parity=False still emitted parity"
+
+    # Canvas click ownership. Old Drawing Mode used to disable direct editing
+    # for as long as its window existed, so leaving it open -- the natural way
+    # to place several shapes -- made every object on the canvas unselectable,
+    # imported SVG included. Routing is now by mode, and this pins it down
+    # without needing a display.
+    class _ClickRoutingProbe(ConstructorApp):
+        def __init__(self, window, mode):
+            self._manual_window = window
+            self._canvas_mode = mode
+
+    class _FakeWindow:
+        def __init__(self, exists): self._exists = exists
+        def winfo_exists(self): return self._exists
+
+    _SEL = ConstructorApp.CANVAS_MODE_SELECT
+    _DRAW = ConstructorApp.CANVAS_MODE_DRAW
+    for _window, _mode, _expected in (
+        (None, _DRAW, _SEL),                      # no window: editor always owns clicks
+        (None, _SEL, _SEL),
+        (_FakeWindow(True), _DRAW, _DRAW),        # open and drawing: placement owns clicks
+        (_FakeWindow(True), _SEL, _SEL),          # open but selecting: editor owns clicks
+        (_FakeWindow(False), _DRAW, _SEL),        # stale handle must not lock the canvas
+    ):
+        _actual = _ClickRoutingProbe(_window, _mode).canvas_click_target()
+        assert _actual == _expected, f"canvas click routing: expected {_expected}, got {_actual}"
 
     alpha_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle r="32" cx="35" cy="65" fill="#F00" opacity="0.5"/><circle r="32" cx="65" cy="65" fill="#0F0" opacity="0.5"/><circle r="32" cx="50" cy="35" fill="#00F" opacity="0.5"/></svg>'
     alpha_path = Path("/tmp/mcoreimg-v4-alpha.svg"); alpha_path.write_text(alpha_svg)
@@ -2172,7 +2328,7 @@ def run_self_test():
 
     # The comparison is genuine rather than a primitive-first preference: when
     # a DoubleBox follows the exact rectangle/line state its vector expansion
-    # is smaller, so protocol v5 deliberately transmits generic vectors.
+    # is smaller, so protocol v6 deliberately transmits generic vectors.
     double_box = quantize_command(VectorCommand(OP_PRIMITIVE, PaintStyle(None, "#FF0000", 2), {
         "kind": PRIM_DOUBLE_BOX, "x1": 100, "y1": 100, "x2": 200, "y2": 200, "percent": 50,
     }, "test doublebox"))
@@ -2235,7 +2391,7 @@ def run_self_test():
     # Local-space SVG groups must have scale-independent payload size. The
     # displayed transform is fixed-width while the local path definition stays
     # unchanged. A repeated copy also reuses that definition.
-    scaling_path = Path("/tmp/mcoreimg-v5-scaling.svg")
+    scaling_path = Path("/tmp/mcoreimg-v6-scaling.svg")
     scaling_path.write_text("""<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 600'><path d='M10 10 C150 590 850 10 990 590 L500 300 Z' fill='#445566'/><path d='M80 500 Q500 40 920 500' fill='none' stroke='#ffffff' stroke-width='8'/></svg>""")
     scaling_doc = import_svg(scaling_path); scaling_path.unlink(missing_ok=True)
     assign_editor_group(scaling_doc.commands, 1)
@@ -2269,16 +2425,20 @@ def verify_build_integrity() -> None:
         "model loaded": getattr(mci, "model", None) is not None,
         "model canvas": getattr(mci, "CANVAS_W", None) == 720
                         and getattr(mci, "CANVAS_H", None) == 480,
-        "codec protocol 6": getattr(mci, "PROTOCOL_VERSION", None) == 6,
+        "codec protocol 7": getattr(mci, "PROTOCOL_VERSION", None) == 7,
+        "multi-image sorter": callable(getattr(mci, "FrameSorter", None))
+                              and getattr(mci, "IMAGE_ID_LEN", None) == 4,
         "codec 10-message envelope": getattr(mci, "MAX_MESSAGES", None) == 10,
-        "codec 150-char messages": getattr(mci, "MESSAGE_LEN", None) == 150,
-        # Record types the v5 transport contract requires.
+        "codec 120-char channel messages": getattr(mci, "MESSAGE_LEN", None) == 120,
+        # Record types the v6 transport contract requires.
         "local-space record": hasattr(mci, "REC_TRANSFORM_GROUP"),
         "group-copy record": hasattr(mci, "REC_GROUP_REPEAT"),
         "single-repeat record": hasattr(mci, "REC_SINGLE_REPEAT"),
         # Codec entry points this editor calls.
         "codec encode_image": callable(getattr(mci, "encode_image", None)),
         "codec decode_frames": callable(getattr(mci, "decode_frames", None)),
+        "RAID 6 parity": getattr(mci, "PARITY_FRAMES", None) == 2
+                         and callable(getattr(mci, "reassemble_frames", None)),
         # Model and primitive support.
         "primitive opcode": OP_PRIMITIVE in OP_NAMES,
         "primitive expansion": callable(getattr(mci, "primitive_to_vectors", None)),
@@ -2301,7 +2461,7 @@ def verify_build_integrity() -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point for version reporting, regression tests, or the Tk GUI."""
     parser = argparse.ArgumentParser(
-        description="MCoreIMG protocol-v5 local-space hybrid SVG and old drawing Constructor")
+        description="MCoreIMG protocol-v7 local-space hybrid SVG and old drawing Constructor")
     parser.add_argument("--self-test", action="store_true",
                         help="run the regression suite and exit")
     parser.add_argument("--version", action="store_true",
